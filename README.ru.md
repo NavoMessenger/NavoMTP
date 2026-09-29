@@ -1,6 +1,6 @@
 # NavoMTP — установка Telemt MTProto Proxy в один клик (Docker, Nginx SNI и FakeTLS)
 
-[简体中文](README.md) | [English](README.en.md) | [Русский](README.ru.md)
+[简体中文](README.zh-CN.md) | [English](README.md) | [Русский](README.ru.md)
 
 > Развёртывание и управление Telegram MTProto Proxy на базе [Telemt](https://github.com/telemt/telemt) на VPS с Debian или Ubuntu. NavoMTP при необходимости устанавливает Docker, направляет FakeTLS-трафик по SNI маскировочного домена с помощью Nginx `ssl_preread` и поддерживает несколько внешних портов.
 
