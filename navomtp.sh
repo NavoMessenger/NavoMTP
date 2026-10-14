@@ -8,6 +8,7 @@ COMPOSE_PROJECT="navomtp"
 TELEMT_IMAGE_DEFAULT="ghcr.io/telemt/telemt:latest"
 NGINX_IMAGE_DEFAULT="nginx:stable-alpine"
 TELEMT_INTERNAL_PORT=9443
+TELEMT_USER_DEFAULT="navo"
 
 log() { printf '[%s] %s\n' "$PROGRAM_NAME" "$*"; }
 warn() { printf '[%s] WARNING: %s\n' "$PROGRAM_NAME" "$*" >&2; }
@@ -105,10 +106,6 @@ lowercase() {
 
 validate_hex32() {
   [[ "$1" =~ ^[0-9A-Fa-f]{32}$ ]]
-}
-
-validate_username() {
-  [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]
 }
 
 validate_ipv4() {
@@ -231,13 +228,13 @@ network_ip() {
 }
 
 collect_configuration() {
-  local default_host default_ports default_user default_secret default_adtag default_domain value normalized
+  local default_host default_ports default_secret default_adtag default_domain value normalized
   default_host="$(state_value PUBLIC_HOST 2>/dev/null || detect_public_ipv4)"
   default_ports="$(state_value PUBLIC_PORTS 2>/dev/null || printf '443')"
-  default_user="$(state_value TELEMT_USER 2>/dev/null || printf 'navo')"
   default_secret="$(state_value TELEMT_SECRET 2>/dev/null || true)"
   default_adtag="$(state_value AD_TAG 2>/dev/null || true)"
   default_domain="$(state_value TLS_DOMAIN 2>/dev/null || printf 'www.microsoft.com')"
+  TELEMT_USER="$TELEMT_USER_DEFAULT"
 
   while :; do
     value="$(dialog_input "公网地址" "填写连接链接中的服务器 IPv4 或域名：" "$default_host")" || return 1
@@ -254,12 +251,6 @@ collect_configuration() {
     else
       dialog_message "输入错误" "端口必须在 1-65535 之间、不可重复，并使用英文逗号分隔。"
     fi
-  done
-
-  while :; do
-    value="$(dialog_input "Telemt 用户" "用户名仅允许字母、数字、下划线和连字符，最长 32 位：" "$default_user")" || return 1
-    if validate_username "$value"; then TELEMT_USER="$value"; break; fi
-    dialog_message "输入错误" "用户名格式不正确。"
   done
 
   while :; do
@@ -670,7 +661,7 @@ install_or_configure() {
   collect_configuration || { log "已取消。"; return 0; }
   local summary adtag_summary
   adtag_summary="${AD_TAG:-未设置}"
-  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\n用户：$TELEMT_USER\nad_tag：$adtag_summary\n伪装域名：$TLS_DOMAIN\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
+  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\nad_tag：$adtag_summary\n伪装域名：$TLS_DOMAIN\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
   dialog_yesno "确认部署" "$summary" || { log "已取消。"; return 0; }
   deploy_configuration
 }

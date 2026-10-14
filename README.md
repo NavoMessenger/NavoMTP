@@ -15,7 +15,7 @@ Discover more Navo projects, products, and updates on the [official Navo website
 | Feature | What it does |
 | --- | --- |
 | One-click Telemt setup | Detects Docker and installs Docker Engine plus the Compose plugin from Docker's official apt repository when missing |
-| Interactive terminal UI | Configures the public address, multiple ports, username, secret, optional `ad_tag`, and FakeTLS camouflage domain |
+| Interactive terminal UI | Configures the public address, multiple ports, secret, optional `ad_tag`, and FakeTLS camouflage domain |
 | Nginx SNI routing | Uses `stream` and `ssl_preread` to forward only the configured camouflage-domain traffic to Telemt |
 | Multiple MTProxy ports | Exposes one Telemt instance through multiple public TCP ports and creates a connection link for each port |
 | Reduced exposure | Publishes only Nginx ports; Telemt `9443`, Metrics, and the Control API remain private |
@@ -67,10 +67,9 @@ The terminal wizard asks for:
 
 1. A public IPv4 address or public hostname;
 2. One or more TCP ports, such as `443,12432,22124`;
-3. A Telemt username;
-4. A 32-character hexadecimal secret, or an empty value to generate one securely;
-5. An optional `ad_tag`;
-6. A FakeTLS camouflage domain, such as `www.microsoft.com`.
+3. A 32-character hexadecimal secret, or an empty value to generate one securely;
+4. An optional `ad_tag`;
+5. A FakeTLS camouflage domain, such as `www.microsoft.com`.
 
 After deployment, NavoMTP prints `tg://proxy` and `https://t.me/proxy` links for every public port. These links contain the proxy secret and should not be posted publicly.
 
@@ -119,7 +118,7 @@ Managed files are stored in `/opt/navomtp` by default:
 - Metrics on `9090` and the Control API on `9091` are not published;
 - wrong SNI, missing SNI, and non-TLS connections are rejected quickly;
 - the camouflage domain does not need to resolve to your proxy server, but it must resolve and serve HTTPS normally;
-- all public ports share one Telemt user, secret, and camouflage domain;
+- all public ports share the same secret and camouflage domain;
 - if UFW is active, NavoMTP asks before opening the selected ports;
 - cloud security groups must be configured manually;
 - make sure operating a proxy complies with the laws and service terms applicable to the server and its users.

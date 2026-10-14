@@ -69,8 +69,6 @@ assert_not_contains() {
 assert_success "valid secret" validate_hex32 0123456789abcdef0123456789abcdef
 assert_failure "short secret" validate_hex32 0123456789abcdef
 assert_failure "secret injection" validate_hex32 '0123456789abcdef0123456789abcde"'
-assert_success "valid username" validate_username navo-user_1
-assert_failure "username injection" validate_username 'navo" = "bad'
 assert_success "valid domain" validate_domain www.microsoft.com
 assert_failure "domain scheme rejected" validate_domain https://example.com
 assert_failure "domain wildcard rejected" validate_domain '*.example.com'
@@ -87,7 +85,7 @@ tmp_dir="$(mktemp -d /tmp/navomtp-tests.XXXXXX)"
 trap 'rm -rf "$tmp_dir"' EXIT
 PUBLIC_HOST="proxy.example.com"
 PUBLIC_PORTS="12432,22124,32332"
-TELEMT_USER="navo"
+TELEMT_USER="$TELEMT_USER_DEFAULT"
 TELEMT_SECRET="0123456789abcdef0123456789abcdef"
 AD_TAG="abcdef0123456789abcdef0123456789"
 TLS_DOMAIN="www.microsoft.com"
@@ -99,6 +97,7 @@ NGINX_IMAGE="$NGINX_IMAGE_DEFAULT"
 
 create_staging_tree "$tmp_dir/stage"
 assert_contains "telemt internal port" "$tmp_dir/stage/config/telemt.toml" 'port = 9443'
+assert_contains "fixed internal telemt user" "$tmp_dir/stage/config/telemt.toml" '"navo" = "0123456789abcdef0123456789abcdef"'
 assert_contains "telemt fake TLS only" "$tmp_dir/stage/config/telemt.toml" 'tls = true'
 assert_contains "telemt proxy protocol" "$tmp_dir/stage/config/telemt.toml" 'proxy_protocol = true'
 assert_contains "telemt trusts only nginx" "$tmp_dir/stage/config/telemt.toml" 'proxy_protocol_trusted_cidrs = ["172.29.241.2/32"]'

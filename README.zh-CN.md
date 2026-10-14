@@ -15,7 +15,7 @@ NavoMTP 适合希望快速搭建 **Telegram MTProxy / MTProto Proxy**，同时�
 | 能力 | 说明 |
 | --- | --- |
 | 一键安装 Telemt | 自动检测 Docker；未安装时通过 Docker 官方 apt 仓库安装 Engine 和 Compose 插件 |
-| 终端可视化配置 | 使用中文 TUI 设置公网地址、多个端口、用户名、密钥、`ad_tag` 和 FakeTLS 伪装域名 |
+| 终端可视化配置 | 使用中文 TUI 设置公网地址、多个端口、密钥、`ad_tag` 和 FakeTLS 伪装域名 |
 | Nginx SNI 分流 | 使用 `stream` + `ssl_preread`，仅将匹配伪装域名的 TLS 流量转发到 Telemt |
 | 多端口 MTProxy | 一个 Telemt 实例可同时通过多个公网 TCP 端口提供服务，并分别生成连接链接 |
 | 更小的暴露面 | 只有 Nginx 端口对外开放；Telemt `9443`、Metrics 和 Control API 不发布到宿主机 |
@@ -67,10 +67,9 @@ sudo bash navomtp.sh install
 
 1. 公网 IPv4 或入口域名；
 2. 一个或多个公网 TCP 端口，例如 `443,12432,22124`；
-3. Telemt 用户名；
-4. 32 位十六进制密钥，留空则自动安全生成；
-5. 可选的 `ad_tag`；
-6. FakeTLS 伪装域名，例如 `www.microsoft.com`。
+3. 32 位十六进制密钥，留空则自动安全生成；
+4. 可选的 `ad_tag`；
+5. FakeTLS 伪装域名，例如 `www.microsoft.com`。
 
 部署完成后，脚本会输出每个公网端口对应的 `tg://proxy` 和 `https://t.me/proxy` 链接。连接链接包含密钥，请勿公开发布。
 
@@ -119,7 +118,7 @@ sudo bash navomtp.sh uninstall   # 删除本项目，不卸载 Docker
 - Metrics `9090` 和 Control API `9091` 均不发布；
 - 未匹配的 SNI、没有 SNI 的连接以及非 TLS 流量会被快速拒绝；
 - 伪装域名不需要解析到代理服务器，但必须能够正常解析并提供 HTTPS；
-- 多个公网端口共用同一个 Telemt 用户、密钥和伪装域名；
+- 多个公网端口共用同一个密钥和伪装域名；
 - 检测到已启用的 UFW 时，脚本会询问是否放行所选端口；
 - 云厂商安全组无法由脚本统一修改，需要在控制台中手动放行；
 - 使用代理服务前，请确认符合服务器所在地及使用者所在地的法律和服务条款。
