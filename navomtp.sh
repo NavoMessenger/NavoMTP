@@ -108,6 +108,26 @@ validate_hex32() {
   [[ "$1" =~ ^[0-9A-Fa-f]{32}$ ]]
 }
 
+normalize_rate_mbps() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9]{1,6}$ ]] || return 1
+  value=$((10#$value))
+  (( value <= 100000 )) || return 1
+  printf '%s' "$value"
+}
+
+rate_limit_label() {
+  if [[ "$1" == 0 ]]; then printf '不限速'; else printf '%s Mbps' "$1"; fi
+}
+
+load_rate_limits() {
+  local upload download
+  upload="$(state_value UPLOAD_LIMIT_MBPS 2>/dev/null || true)"
+  download="$(state_value DOWNLOAD_LIMIT_MBPS 2>/dev/null || true)"
+  UPLOAD_LIMIT_MBPS="$(normalize_rate_mbps "${upload:-0}")" || return 1
+  DOWNLOAD_LIMIT_MBPS="$(normalize_rate_mbps "${download:-0}")" || return 1
+}
+
 validate_ipv4() {
   local value="$1" part
   local -a octets
@@ -235,6 +255,7 @@ collect_configuration() {
   default_adtag="$(state_value AD_TAG 2>/dev/null || true)"
   default_domain="$(state_value TLS_DOMAIN 2>/dev/null || printf 'www.microsoft.com')"
   TELEMT_USER="$TELEMT_USER_DEFAULT"
+  load_rate_limits || { warn "保存的限速值无效，请检查 state.env。"; return 1; }
 
   while :; do
     value="$(dialog_input "公网地址" "填写连接链接中的服务器 IPv4 或域名：" "$default_host")" || return 1
@@ -273,6 +294,26 @@ collect_configuration() {
     dialog_message "输入错误" "请输入有效的 ASCII 域名，例如 www.microsoft.com。"
   done
 
+  local direction current_rate
+  for direction in UPLOAD DOWNLOAD; do
+    if [[ "$direction" == UPLOAD ]]; then
+      current_rate="$UPLOAD_LIMIT_MBPS"
+      value="上行限速（客户端 → Telegram）"
+    else
+      current_rate="$DOWNLOAD_LIMIT_MBPS"
+      value="下行限速（Telegram → 客户端）"
+    fi
+    local rate_title="$value"
+    while :; do
+      value="$(dialog_input "$rate_title" "所有客户端及公开端口共享；填写 0–100000 的整数 Mbps，0 表示不限速：" "$current_rate")" || return 1
+      if normalized="$(normalize_rate_mbps "$value")"; then
+        printf -v "${direction}_LIMIT_MBPS" '%s' "$normalized"
+        break
+      fi
+      dialog_message "输入错误" "限速必须是 0–100000 的整数 Mbps，0 表示不限速。"
+    done
+  done
+
   if ! probe_camouflage_domain "$TLS_DOMAIN"; then
     dialog_yesno "域名探测失败" "无法确认 $TLS_DOMAIN 的 DNS 或 443/TLS 可达性。继续可能导致 FakeTLS 不可用。是否仍然继续？" || return 1
   fi
@@ -285,7 +326,9 @@ collect_configuration() {
 }
 
 render_telemt_config() {
-  local destination="$1" first_port adtag_line=""
+  local destination="$1" first_port adtag_line="" upload download
+  upload="$(normalize_rate_mbps "${UPLOAD_LIMIT_MBPS:-0}")" || return 1
+  download="$(normalize_rate_mbps "${DOWNLOAD_LIMIT_MBPS:-0}")" || return 1
   first_port="${PUBLIC_PORTS%%,*}"
   [[ -z "$AD_TAG" ]] || adtag_line="ad_tag = \"$AD_TAG\""
   cat > "$destination" <<EOF
@@ -324,6 +367,10 @@ tls_front_dir = "tlsfront"
 [access.users]
 "${TELEMT_USER}" = "${TELEMT_SECRET}"
 EOF
+  if (( upload > 0 || download > 0 )); then
+    printf '\n[access.user_rate_limits]\n"%s" = { up_bps = %s, down_bps = %s }\n' \
+      "$TELEMT_USER" "$((upload * 1000000))" "$((download * 1000000))" >> "$destination"
+  fi
 }
 
 render_nginx_config() {
@@ -473,6 +520,8 @@ TELEMT_USER=${TELEMT_USER}
 TELEMT_SECRET=${TELEMT_SECRET}
 AD_TAG=${AD_TAG}
 TLS_DOMAIN=${TLS_DOMAIN}
+UPLOAD_LIMIT_MBPS=${UPLOAD_LIMIT_MBPS:-0}
+DOWNLOAD_LIMIT_MBPS=${DOWNLOAD_LIMIT_MBPS:-0}
 NETWORK_SUBNET=${NETWORK_SUBNET}
 NGINX_IP=${NGINX_IP}
 TELEMT_IP=${TELEMT_IP}
@@ -492,6 +541,35 @@ create_staging_tree() {
   chmod 0644 "$staging/nginx/nginx.conf" "$staging/compose.yaml"
 }
 
+telemt_config_check() {
+  local config_file="$1"
+  timeout 30 docker run --rm --user 0:0 --read-only --network none --tmpfs /run/telemt:rw,mode=1777,size=4m \
+    -w /run/telemt -v "$config_file:/etc/telemt/config.toml:ro" \
+    "$TELEMT_IMAGE" healthcheck /etc/telemt/config.toml --mode liveness
+}
+
+verify_rate_limit_support() {
+  local staging="$1" probe_dir field result=0
+  [[ "${UPLOAD_LIMIT_MBPS:-0}" != 0 || "${DOWNLOAD_LIMIT_MBPS:-0}" != 0 ]] || return 0
+  probe_dir="$(mktemp -d "$staging/rate-probe.XXXXXX")" || return 1
+  # A lenient old parser may silently ignore new keys. It must reject a wrong
+  # type for EACH direction, in addition to accepting the real candidate.
+  for field in up_bps down_bps; do
+    sed "s/${field} = [0-9][0-9]*/${field} = \"unsupported-probe\"/" \
+      "$staging/config/telemt.toml" > "$probe_dir/config.toml"
+    if telemt_config_check "$probe_dir/config.toml" > "$probe_dir/output" 2>&1; then
+      result=1
+    elif ! grep -Eq 'invalid type.*string|expected.*u64|expected.*integer' "$probe_dir/output"; then
+      result=1
+    fi
+  done
+  rm -rf -- "$probe_dir"
+  if (( result != 0 )); then
+    warn "无法确认当前 Telemt 镜像支持独立上下行限速。现有部署未替换，请先通过“更新镜像”升级后重试。"
+    return 1
+  fi
+}
+
 verify_images_and_staging() {
   local staging="$1" nginx_build
   log "拉取并验证容器镜像..."
@@ -504,9 +582,11 @@ verify_images_and_staging() {
   fi
   docker compose --project-name "$COMPOSE_PROJECT" -f "$staging/compose.yaml" config --quiet || return 1
   docker run --rm -v "$staging/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" "$NGINX_IMAGE" nginx -t || return 1
-  docker run --rm --user 0:0 --read-only --tmpfs /run/telemt:rw,mode=1777,size=4m \
-    -w /run/telemt -v "$staging/config/telemt.toml:/etc/telemt/config.toml:ro" \
-    "$TELEMT_IMAGE" healthcheck /etc/telemt/config.toml --mode liveness
+  if ! telemt_config_check "$staging/config/telemt.toml"; then
+    warn "Telemt 配置验证失败；若设置了限速，请通过“更新镜像”升级后重试。"
+    return 1
+  fi
+  verify_rate_limit_support "$staging"
 }
 
 backup_current() {
@@ -661,7 +741,7 @@ install_or_configure() {
   collect_configuration || { log "已取消。"; return 0; }
   local summary adtag_summary
   adtag_summary="${AD_TAG:-未设置}"
-  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\nad_tag：$adtag_summary\n伪装域名：$TLS_DOMAIN\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
+  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\nad_tag：$adtag_summary\n伪装域名：$TLS_DOMAIN\n上行：$(rate_limit_label "$UPLOAD_LIMIT_MBPS")\n下行：$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")\n（所有客户端及端口共享）\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
   dialog_yesno "确认部署" "$summary" || { log "已取消。"; return 0; }
   deploy_configuration
 }
@@ -678,6 +758,7 @@ load_state() {
   TELEMT_SECRET="$(state_value TELEMT_SECRET)"
   AD_TAG="$(state_value AD_TAG || true)"
   TLS_DOMAIN="$(state_value TLS_DOMAIN)"
+  load_rate_limits || die "保存的限速值无效，请检查 state.env。"
   NETWORK_SUBNET="$(state_value NETWORK_SUBNET)"
   NGINX_IP="$(state_value NGINX_IP)"
   TELEMT_IP="$(state_value TELEMT_IP)"
@@ -692,6 +773,9 @@ show_status() {
   printf '\n镜像摘要：\n'
   [[ ! -f "$INSTALL_DIR/image-digests.txt" ]] || sed -n '1,3p' "$INSTALL_DIR/image-digests.txt"
   printf '\n公开 TCP 端口：%s\n' "$(state_value PUBLIC_PORTS)"
+  load_rate_limits || die "保存的限速值无效，请检查 state.env。"
+  printf '上行限速：%s\n下行限速：%s\n（所有客户端及公开端口共享）\n' \
+    "$(rate_limit_label "$UPLOAD_LIMIT_MBPS")" "$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")"
   printf '云厂商安全组需单独确认。\n'
 }
 

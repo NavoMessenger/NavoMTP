@@ -80,6 +80,18 @@ assert_failure "duplicate ports" normalize_ports '443,443'
 assert_failure "zero port" normalize_ports '0'
 assert_failure "oversized port" normalize_ports '65536'
 assert_failure "port injection" normalize_ports '443;id'
+assert_equal "unlimited rate" 0 "$(normalize_rate_mbps 0)"
+assert_equal "positive rate" 25 "$(normalize_rate_mbps 25)"
+assert_equal "maximum rate" 100000 "$(normalize_rate_mbps 100000)"
+assert_equal "leading zero decimal rate" 8 "$(normalize_rate_mbps 000008)"
+assert_failure "empty rate" normalize_rate_mbps ''
+assert_failure "negative rate" normalize_rate_mbps -1
+assert_failure "fractional rate" normalize_rate_mbps 1.5
+assert_failure "oversized rate" normalize_rate_mbps 100001
+assert_failure "overflow rate" normalize_rate_mbps 999999999999999999999
+assert_failure "rate injection" normalize_rate_mbps '1;id'
+assert_equal "unlimited display" '不限速' "$(rate_limit_label 0)"
+assert_equal "limited display" '25 Mbps' "$(rate_limit_label 25)"
 
 tmp_dir="$(mktemp -d /tmp/navomtp-tests.XXXXXX)"
 trap 'rm -rf "$tmp_dir"' EXIT
@@ -96,6 +108,9 @@ TELEMT_IMAGE="$TELEMT_IMAGE_DEFAULT"
 NGINX_IMAGE="$NGINX_IMAGE_DEFAULT"
 
 create_staging_tree "$tmp_dir/stage"
+assert_not_contains "unlimited omits rate table" "$tmp_dir/stage/config/telemt.toml" '[access.user_rate_limits]'
+assert_contains "default upload state" "$tmp_dir/stage/state.env" 'UPLOAD_LIMIT_MBPS=0'
+assert_contains "default download state" "$tmp_dir/stage/state.env" 'DOWNLOAD_LIMIT_MBPS=0'
 assert_contains "telemt internal port" "$tmp_dir/stage/config/telemt.toml" 'port = 9443'
 assert_contains "fixed internal telemt user" "$tmp_dir/stage/config/telemt.toml" '"navo" = "0123456789abcdef0123456789abcdef"'
 assert_contains "telemt fake TLS only" "$tmp_dir/stage/config/telemt.toml" 'tls = true'
@@ -114,6 +129,145 @@ assert_not_contains "compose does not publish metrics" "$tmp_dir/stage/compose.y
 
 mode_secret="$(stat -c '%a' "$tmp_dir/stage/config/telemt.toml" 2>/dev/null || stat -f '%Lp' "$tmp_dir/stage/config/telemt.toml")"
 assert_equal "secret config mode" "600" "$mode_secret"
+
+UPLOAD_LIMIT_MBPS=10
+DOWNLOAD_LIMIT_MBPS=25
+render_telemt_config "$tmp_dir/rates.toml"
+assert_contains "independent Mbps conversion" "$tmp_dir/rates.toml" '"navo" = { up_bps = 10000000, down_bps = 25000000 }'
+UPLOAD_LIMIT_MBPS=100000
+DOWNLOAD_LIMIT_MBPS=0
+render_telemt_config "$tmp_dir/rates.toml"
+assert_contains "upload only and maximum conversion" "$tmp_dir/rates.toml" '{ up_bps = 100000000000, down_bps = 0 }'
+UPLOAD_LIMIT_MBPS=0
+DOWNLOAD_LIMIT_MBPS=8
+TELEMT_USER=legacy-user
+render_telemt_config "$tmp_dir/rates.toml"
+assert_contains "download only uses current user" "$tmp_dir/rates.toml" '"legacy-user" = { up_bps = 0, down_bps = 8000000 }'
+TELEMT_USER="$TELEMT_USER_DEFAULT"
+
+INSTALL_DIR="$tmp_dir/state-tests"
+create_staging_tree "$INSTALL_DIR"
+UPLOAD_LIMIT_MBPS=999
+DOWNLOAD_LIMIT_MBPS=999
+load_state
+assert_equal "load saved upload" 0 "$UPLOAD_LIMIT_MBPS"
+assert_equal "load saved download" 8 "$DOWNLOAD_LIMIT_MBPS"
+sed '/^UPLOAD_LIMIT_MBPS=/d; /^DOWNLOAD_LIMIT_MBPS=/d' "$INSTALL_DIR/state.env" > "$tmp_dir/old-state.env"
+cp "$tmp_dir/old-state.env" "$INSTALL_DIR/state.env"
+load_state
+assert_equal "legacy upload defaults unlimited" 0 "$UPLOAD_LIMIT_MBPS"
+assert_equal "legacy download defaults unlimited" 0 "$DOWNLOAD_LIMIT_MBPS"
+
+# The compatibility probe must catch silent ignores, either unsupported
+# direction, and unrelated failures rather than treating any error as support.
+test_rate_support() (
+  local support_mode="$1"
+  UPLOAD_LIMIT_MBPS=10
+  DOWNLOAD_LIMIT_MBPS=20
+  create_staging_tree "$tmp_dir/support"
+  telemt_config_check() {
+    case "$support_mode" in
+      supported) printf 'invalid type: string, expected u64\n' >&2; return 1 ;;
+      ignored) return 0 ;;
+      upload-only)
+        if grep -q 'down_bps = "unsupported-probe"' "$1"; then return 0; fi
+        printf 'invalid type: string, expected u64\n' >&2; return 1 ;;
+      unrelated) printf 'Cannot connect to Docker\n' >&2; return 1 ;;
+    esac
+  }
+  verify_rate_limit_support "$tmp_dir/support"
+)
+assert_success "native parser recognizes both directions" test_rate_support supported
+assert_failure "silent ignored keys rejected" test_rate_support ignored
+assert_failure "one unsupported direction rejected" test_rate_support upload-only
+assert_failure "unrelated probe failure rejected" test_rate_support unrelated
+
+test_rate_rollback() (
+  INSTALL_DIR="$tmp_dir/rollback"
+  UPLOAD_LIMIT_MBPS=10
+  DOWNLOAD_LIMIT_MBPS=20
+  create_staging_tree "$INSTALL_DIR"
+  local original
+  original="$(<"$INSTALL_DIR/state.env")"
+  backup_current "$tmp_dir/backup"
+  UPLOAD_LIMIT_MBPS=99
+  DOWNLOAD_LIMIT_MBPS=88
+  render_state "$INSTALL_DIR/state.env"
+  render_telemt_config "$INSTALL_DIR/config/telemt.toml"
+  restore_backup "$tmp_dir/backup"
+  [[ "$(<"$INSTALL_DIR/state.env")" == "$original" ]] || return 1
+  grep -Fq 'up_bps = 10000000, down_bps = 20000000' "$INSTALL_DIR/config/telemt.toml"
+)
+assert_success "rollback restores saved limits and config" test_rate_rollback
+
+test_rate_wizard() (
+  INSTALL_DIR="$tmp_dir/wizard"
+  UPLOAD_LIMIT_MBPS=12
+  DOWNLOAD_LIMIT_MBPS=34
+  create_staging_tree "$INSTALL_DIR"
+  dialog_input() {
+    printf '%s\n' "$1" >> "$tmp_dir/prompts"
+    case "$1" in
+      '上行限速（客户端 → Telegram）') [[ "$3" == 12 ]] || return 1 ;;
+      '下行限速（Telegram → 客户端）') [[ "$3" == 34 ]] || return 1 ;;
+      'Telemt 用户') return 1 ;;
+    esac
+    printf '%s' "$3"
+  }
+  check_ports_available() { return 0; }
+  probe_camouflage_domain() { return 0; }
+  select_network() { printf '%s' '172.29.241.0/24'; }
+  collect_configuration || return 1
+  [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]] || return 1
+  [[ "$(tail -n 3 "$tmp_dir/prompts")" == $'伪装域名\n上行限速（客户端 → Telegram）\n下行限速（Telegram → 客户端）' ]]
+)
+assert_success "wizard restores rates after domain without user prompt" test_rate_wizard
+
+test_rate_update() (
+  INSTALL_DIR="$tmp_dir/update"
+  UPLOAD_LIMIT_MBPS=12
+  DOWNLOAD_LIMIT_MBPS=34
+  create_staging_tree "$INSTALL_DIR"
+  local original
+  original="$(<"$INSTALL_DIR/config/telemt.toml")"
+  require_root() { return 0; }
+  require_supported_host() { return 0; }
+  install_base_dependencies() { return 0; }
+  ensure_docker() { return 0; }
+  dialog_yesno() { return 0; }
+  docker() { printf 'test-image-id'; }
+  compose() { return 0; }
+  verify_images_and_staging() { [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]]; }
+  wait_for_healthy() { return 0; }
+  record_image_digests() { return 0; }
+  write_links() { return 0; }
+  update_images || return 1
+  [[ "$(<"$INSTALL_DIR/config/telemt.toml")" == "$original" ]]
+)
+assert_success "image update loads and preserves independent rates" test_rate_update
+
+test_rate_deploy_failure() (
+  INSTALL_DIR="$tmp_dir/deploy-rollback"
+  UPLOAD_LIMIT_MBPS=12
+  DOWNLOAD_LIMIT_MBPS=34
+  create_staging_tree "$INSTALL_DIR"
+  local original
+  original="$(<"$INSTALL_DIR/state.env")"
+  UPLOAD_LIMIT_MBPS=99
+  DOWNLOAD_LIMIT_MBPS=88
+  verify_images_and_staging() { return 0; }
+  # Exercise the real backup and rollback flow without requiring root chown.
+  install_staging() {
+    cp "$1/state.env" "$INSTALL_DIR/state.env"
+    cp "$1/config/telemt.toml" "$INSTALL_DIR/config/telemt.toml"
+  }
+  compose() { return 0; }
+  wait_for_healthy() { return 1; }
+  if deploy_configuration; then return 1; fi
+  [[ "$(<"$INSTALL_DIR/state.env")" == "$original" ]] || return 1
+  grep -Fq 'up_bps = 12000000, down_bps = 34000000' "$INSTALL_DIR/config/telemt.toml"
+)
+assert_success "failed deployment restores previous limits" test_rate_deploy_failure
 
 INSTALL_DIR="$tmp_dir/link-output"
 mkdir -p "$INSTALL_DIR"

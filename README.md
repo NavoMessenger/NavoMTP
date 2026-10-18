@@ -69,7 +69,12 @@ The terminal wizard asks for:
 2. One or more TCP ports, such as `443,12432,22124`;
 3. A 32-character hexadecimal secret, or an empty value to generate one securely;
 4. An optional `ad_tag`;
-5. A FakeTLS camouflage domain, such as `www.microsoft.com`.
+5. A FakeTLS camouflage domain, such as `www.microsoft.com`;
+6. Separate upload and download limits in integer Mbps (`0–100000`); `0` means unlimited.
+
+Upload means client → Telegram; download means Telegram → client. All clients and public ports sharing the proxy secret share each direction's total limit. For example, upload `10` and download `25` set independent totals of 10 Mbps and 25 Mbps (1 Mbps = 1,000,000 bits/s, not 1 MB/s). These are sustained average limits with bounded bursts.
+
+Both limits default to unlimited, including existing deployments without saved limits. Run `sudo bash navomtp.sh configure` to change them or enter `0` to remove either limit; `status` displays both. Image updates preserve the settings. If the current Telemt image does not recognize the limit fields, validation stops before replacing the deployment; use the existing `update` command to upgrade and retry.
 
 After deployment, NavoMTP prints `tg://proxy` and `https://t.me/proxy` links for every public port. These links contain the proxy secret and should not be posted publicly.
 
