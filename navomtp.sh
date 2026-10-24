@@ -128,6 +128,91 @@ load_rate_limits() {
   DOWNLOAD_LIMIT_MBPS="$(normalize_rate_mbps "${download:-0}")" || return 1
 }
 
+# Legacy scalar values remain a read-compatible view of the first group.
+group_value() {
+  local field="$1" index="$2"
+  if [[ -n "${GROUP_COUNT:-}" ]]; then
+    case "$field" in
+      USER) printf '%s' "${GROUP_USERS[$index]}" ;;
+      SECRET) printf '%s' "${GROUP_SECRETS[$index]}" ;;
+      TAG) printf '%s' "${GROUP_TAGS[$index]}" ;;
+      UP) printf '%s' "${GROUP_UP[$index]}" ;;
+      DOWN) printf '%s' "${GROUP_DOWN[$index]}" ;;
+    esac
+  else
+    case "$field" in
+      USER) printf '%s' "${TELEMT_USER:-navo}" ;;
+      SECRET) printf '%s' "${TELEMT_SECRET:-}" ;;
+      TAG) printf '%s' "${AD_TAG:-}" ;;
+      UP) printf '%s' "${UPLOAD_LIMIT_MBPS:-0}" ;;
+      DOWN) printf '%s' "${DOWNLOAD_LIMIT_MBPS:-0}" ;;
+    esac
+  fi
+}
+
+load_groups() {
+  local count i key value
+  count="$(state_value GROUP_COUNT 2>/dev/null || true)"
+  GROUP_USERS=() GROUP_SECRETS=() GROUP_TAGS=() GROUP_UP=() GROUP_DOWN=()
+  if [[ -z "$count" ]]; then
+    GROUP_COUNT=1
+    GROUP_USERS[0]="$(state_value TELEMT_USER 2>/dev/null || true)"
+    GROUP_USERS[0]="${GROUP_USERS[0]:-navo}"
+    GROUP_SECRETS[0]="$(state_value TELEMT_SECRET 2>/dev/null || true)"
+    GROUP_TAGS[0]="$(state_value AD_TAG 2>/dev/null || true)"
+    load_rate_limits || return 1
+    GROUP_UP[0]="$UPLOAD_LIMIT_MBPS" GROUP_DOWN[0]="$DOWNLOAD_LIMIT_MBPS"
+  else
+    [[ "$count" =~ ^[1-9][0-9]{0,2}$ ]] && (( count <= 100 )) || return 1
+    GROUP_COUNT="$count"
+    for ((i=0; i<GROUP_COUNT; i++)); do
+      key="GROUP_$((i+1))"
+      GROUP_USERS[i]="$(state_value "${key}_USER")"
+      GROUP_SECRETS[i]="$(state_value "${key}_SECRET")"
+      GROUP_TAGS[i]="$(state_value "${key}_TAG")"
+      value="$(state_value "${key}_UPLOAD_MBPS")"
+      GROUP_UP[i]="$(normalize_rate_mbps "$value")" || return 1
+      value="$(state_value "${key}_DOWNLOAD_MBPS")"
+      GROUP_DOWN[i]="$(normalize_rate_mbps "$value")" || return 1
+    done
+  fi
+  for ((i=0; i<GROUP_COUNT; i++)); do
+    GROUP_SECRETS[i]="$(lowercase "${GROUP_SECRETS[$i]}")"
+    GROUP_TAGS[i]="$(lowercase "${GROUP_TAGS[$i]}")"
+  done
+}
+
+validate_groups() {
+  local i user secret tag seen_users='|' seen_secrets='|'
+  [[ "${GROUP_COUNT:-1}" =~ ^[1-9][0-9]{0,2}$ ]] && (( ${GROUP_COUNT:-1} <= 100 )) || return 1
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    user="$(group_value USER "$i")" secret="$(group_value SECRET "$i")" tag="$(group_value TAG "$i")"
+    [[ "$user" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || return 1
+    validate_hex32 "$secret" || return 1
+    [[ -z "$tag" ]] || validate_hex32 "$tag" || return 1
+    secret="$(lowercase "$secret")"
+    [[ "$seen_users" != *"|$user|"* && "$seen_secrets" != *"|$secret|"* ]] || return 1
+    seen_users+="$user|" seen_secrets+="$secret|"
+    normalize_rate_mbps "$(group_value UP "$i")" >/dev/null || return 1
+    normalize_rate_mbps "$(group_value DOWN "$i")" >/dev/null || return 1
+  done
+}
+
+sync_first_group() {
+  TELEMT_USER="${GROUP_USERS[0]}" TELEMT_SECRET="${GROUP_SECRETS[0]}" AD_TAG="${GROUP_TAGS[0]}"
+  UPLOAD_LIMIT_MBPS="${GROUP_UP[0]}" DOWNLOAD_LIMIT_MBPS="${GROUP_DOWN[0]}"
+}
+
+group_summary() {
+  local i tag
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    tag="$(group_value TAG "$i")"
+    printf '组 %s | ad_tag：%s | 上行：%s | 下行：%s\n' "$((i+1))" \
+      "${tag:-未设置}" \
+      "$(rate_limit_label "$(group_value UP "$i")")" "$(rate_limit_label "$(group_value DOWN "$i")")"
+  done
+}
+
 validate_ipv4() {
   local value="$1" part
   local -a octets
@@ -248,14 +333,11 @@ network_ip() {
 }
 
 collect_configuration() {
-  local default_host default_ports default_secret default_adtag default_domain value normalized
+  local default_host default_ports default_domain value normalized
   default_host="$(state_value PUBLIC_HOST 2>/dev/null || detect_public_ipv4)"
   default_ports="$(state_value PUBLIC_PORTS 2>/dev/null || printf '443')"
-  default_secret="$(state_value TELEMT_SECRET 2>/dev/null || true)"
-  default_adtag="$(state_value AD_TAG 2>/dev/null || true)"
   default_domain="$(state_value TLS_DOMAIN 2>/dev/null || printf 'www.microsoft.com')"
-  TELEMT_USER="$TELEMT_USER_DEFAULT"
-  load_rate_limits || { warn "保存的限速值无效，请检查 state.env。"; return 1; }
+  load_groups || { warn "保存的连接组配置无效，请检查 state.env。"; return 1; }
 
   while :; do
     value="$(dialog_input "公网地址" "填写连接链接中的服务器 IPv4 或域名：" "$default_host")" || return 1
@@ -275,44 +357,70 @@ collect_configuration() {
   done
 
   while :; do
-    value="$(dialog_input "访问密钥" "填写 32 位十六进制密钥；留空则自动安全生成：" "$default_secret")" || return 1
-    [[ -n "$value" ]] || value="$(generate_secret)"
-    if validate_hex32 "$value"; then TELEMT_SECRET="$(lowercase "$value")"; break; fi
-    dialog_message "输入错误" "密钥必须正好是 32 位十六进制字符。"
-  done
-
-  while :; do
-    value="$(dialog_input "广告标签" "填写 @MTProxybot 提供的 32 位十六进制 ad_tag；可留空：" "$default_adtag")" || return 1
-    if [[ -z "$value" ]] || validate_hex32 "$value"; then AD_TAG="$(lowercase "$value")"; break; fi
-    dialog_message "输入错误" "ad_tag 必须留空或正好为 32 位十六进制字符。"
-  done
-
-  while :; do
     value="$(dialog_input "伪装域名" "填写 FakeTLS 伪装域名（不要包含 https:// 或路径）：" "$default_domain")" || return 1
     value="$(lowercase "$value")"
     if validate_domain "$value"; then TLS_DOMAIN="$value"; break; fi
     dialog_message "输入错误" "请输入有效的 ASCII 域名，例如 www.microsoft.com。"
   done
 
-  local direction current_rate
-  for direction in UPLOAD DOWNLOAD; do
-    if [[ "$direction" == UPLOAD ]]; then
-      current_rate="$UPLOAD_LIMIT_MBPS"
-      value="上行限速（客户端 → Telegram）"
-    else
-      current_rate="$DOWNLOAD_LIMIT_MBPS"
-      value="下行限速（Telegram → 客户端）"
+  local i j old_count="$GROUP_COUNT" duplicate direction current_rate rate_title candidate_counter
+  while :; do
+    value="$(dialog_input "连接组数量" "每组独立密钥、ad_tag 和限速，共用端口。填写 1–100；减少数量将删除末尾组：" "$GROUP_COUNT")" || return 1
+    if [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( 10#$value >= 1 && 10#$value <= 100 )); then
+      normalized=$((10#$value))
+      if (( normalized < old_count )); then
+        dialog_yesno "删除连接组" "将删除第 $((normalized+1)) 至 $old_count 组，其旧连接链接将失效。确认继续？" || return 1
+      fi
+      GROUP_COUNT="$normalized"
+      break
     fi
-    local rate_title="$value"
+    dialog_message "输入错误" "连接组数量必须为 1–100。"
+  done
+  for ((i=0; i<GROUP_COUNT; i++)); do
+    if [[ -z "${GROUP_USERS[$i]:-}" ]]; then
+      candidate_counter=$((i+1))
+      while :; do
+        GROUP_USERS[i]="navo_$candidate_counter"
+        duplicate=0
+        for ((j=0; j<i; j++)); do [[ "${GROUP_USERS[$i]}" != "${GROUP_USERS[$j]}" ]] || duplicate=1; done
+        (( duplicate == 1 )) || break
+        candidate_counter=$((candidate_counter+1))
+      done
+    fi
     while :; do
-      value="$(dialog_input "$rate_title" "所有客户端及公开端口共享；填写 0–100000 的整数 Mbps，0 表示不限速：" "$current_rate")" || return 1
+      value="$(dialog_input "组 $((i+1))：访问密钥" "32 位十六进制；留空安全生成。每组密钥必须不同：" "${GROUP_SECRETS[$i]:-}")" || return 1
+      [[ -n "$value" ]] || value="$(generate_secret)"
+      duplicate=0
+      if validate_hex32 "$value"; then
+        value="$(lowercase "$value")"
+        for ((j=0; j<i; j++)); do [[ "$value" != "${GROUP_SECRETS[$j]}" ]] || duplicate=1; done
+        if (( duplicate == 0 )); then GROUP_SECRETS[i]="$value"; break; fi
+      fi
+      dialog_message "输入错误" "密钥必须是 32 位十六进制，且不能与前面的组重复。"
+    done
+    while :; do
+      value="$(dialog_input "组 $((i+1))：广告标签" "填写该组 @MTProxybot 提供的 32 位十六进制 ad_tag；可留空：" "${GROUP_TAGS[$i]:-}")" || return 1
+      if [[ -z "$value" ]] || validate_hex32 "$value"; then GROUP_TAGS[i]="$(lowercase "$value")"; break; fi
+      dialog_message "输入错误" "ad_tag 必须留空或为 32 位十六进制。"
+    done
+    for direction in UP DOWN; do
+      if [[ "$direction" == UP ]]; then
+        current_rate="${GROUP_UP[$i]:-0}" rate_title="上行限速（客户端 → Telegram）"
+      else
+        current_rate="${GROUP_DOWN[$i]:-0}" rate_title="下行限速（Telegram → 客户端）"
+      fi
+    while :; do
+      value="$(dialog_input "组 $((i+1))：$rate_title" "本组所有客户端及公开端口共享；整数 Mbps，0–100000，0 不限速：" "$current_rate")" || return 1
       if normalized="$(normalize_rate_mbps "$value")"; then
-        printf -v "${direction}_LIMIT_MBPS" '%s' "$normalized"
+        if [[ "$direction" == UP ]]; then GROUP_UP[i]="$normalized"; else GROUP_DOWN[i]="$normalized"; fi
         break
       fi
       dialog_message "输入错误" "限速必须是 0–100000 的整数 Mbps，0 表示不限速。"
     done
+    done
   done
+  sync_first_group
+  validate_groups || { warn "连接组配置无效。"; return 1; }
 
   if ! probe_camouflage_domain "$TLS_DOMAIN"; then
     dialog_yesno "域名探测失败" "无法确认 $TLS_DOMAIN 的 DNS 或 443/TLS 可达性。继续可能导致 FakeTLS 不可用。是否仍然继续？" || return 1
@@ -326,15 +434,12 @@ collect_configuration() {
 }
 
 render_telemt_config() {
-  local destination="$1" first_port adtag_line="" upload download
-  upload="$(normalize_rate_mbps "${UPLOAD_LIMIT_MBPS:-0}")" || return 1
-  download="$(normalize_rate_mbps "${DOWNLOAD_LIMIT_MBPS:-0}")" || return 1
+  local destination="$1" first_port upload download i user tag
+  validate_groups || return 1
   first_port="${PUBLIC_PORTS%%,*}"
-  [[ -z "$AD_TAG" ]] || adtag_line="ad_tag = \"$AD_TAG\""
   cat > "$destination" <<EOF
 [general]
 use_middle_proxy = true
-${adtag_line}
 log_level = "normal"
 
 [general.modes]
@@ -365,12 +470,26 @@ tls_emulation = true
 tls_front_dir = "tlsfront"
 
 [access.users]
-"${TELEMT_USER}" = "${TELEMT_SECRET}"
 EOF
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    printf '"%s" = "%s"\n' "$(group_value USER "$i")" "$(group_value SECRET "$i")" >> "$destination"
+  done
+  printf '\n[access.user_ad_tags]\n' >> "$destination"
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    tag="$(group_value TAG "$i")"
+    [[ -z "$tag" ]] || printf '"%s" = "%s"\n' "$(group_value USER "$i")" "$tag" >> "$destination"
+  done
+  local rate_header=0
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    user="$(group_value USER "$i")"
+    upload="$(normalize_rate_mbps "$(group_value UP "$i")")" || return 1
+    download="$(normalize_rate_mbps "$(group_value DOWN "$i")")" || return 1
   if (( upload > 0 || download > 0 )); then
-    printf '\n[access.user_rate_limits]\n"%s" = { up_bps = %s, down_bps = %s }\n' \
-      "$TELEMT_USER" "$((upload * 1000000))" "$((download * 1000000))" >> "$destination"
+    if (( rate_header == 0 )); then printf '\n[access.user_rate_limits]\n' >> "$destination"; rate_header=1; fi
+    printf '"%s" = { up_bps = %s, down_bps = %s }\n' \
+      "$user" "$((upload * 1000000))" "$((download * 1000000))" >> "$destination"
   fi
+  done
 }
 
 render_nginx_config() {
@@ -512,7 +631,7 @@ EOF
 }
 
 render_state() {
-  local destination="$1"
+  local destination="$1" i
   cat > "$destination" <<EOF
 PUBLIC_HOST=${PUBLIC_HOST}
 PUBLIC_PORTS=${PUBLIC_PORTS}
@@ -528,12 +647,19 @@ TELEMT_IP=${TELEMT_IP}
 TELEMT_IMAGE=${TELEMT_IMAGE}
 NGINX_IMAGE=${NGINX_IMAGE}
 EOF
+  printf 'GROUP_COUNT=%s\n' "${GROUP_COUNT:-1}" >> "$destination"
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    printf 'GROUP_%s_USER=%s\nGROUP_%s_SECRET=%s\nGROUP_%s_TAG=%s\nGROUP_%s_UPLOAD_MBPS=%s\nGROUP_%s_DOWNLOAD_MBPS=%s\n' \
+      "$((i+1))" "$(group_value USER "$i")" "$((i+1))" "$(group_value SECRET "$i")" \
+      "$((i+1))" "$(group_value TAG "$i")" "$((i+1))" "$(group_value UP "$i")" \
+      "$((i+1))" "$(group_value DOWN "$i")" >> "$destination"
+  done
 }
 
 create_staging_tree() {
   local staging="$1"
   install -d -m 0700 "$staging/config" "$staging/nginx"
-  render_telemt_config "$staging/config/telemt.toml"
+  render_telemt_config "$staging/config/telemt.toml" || return 1
   render_nginx_config "$staging/nginx/nginx.conf"
   render_compose "$staging/compose.yaml"
   render_state "$staging/state.env"
@@ -550,7 +676,7 @@ telemt_config_check() {
 
 verify_rate_limit_support() {
   local staging="$1" probe_dir field result=0
-  [[ "${UPLOAD_LIMIT_MBPS:-0}" != 0 || "${DOWNLOAD_LIMIT_MBPS:-0}" != 0 ]] || return 0
+  grep -q '^\[access.user_rate_limits\]' "$staging/config/telemt.toml" || return 0
   probe_dir="$(mktemp -d "$staging/rate-probe.XXXXXX")" || return 1
   # A lenient old parser may silently ignore new keys. It must reject a wrong
   # type for EACH direction, in addition to accepting the real candidate.
@@ -566,6 +692,25 @@ verify_rate_limit_support() {
   rm -rf -- "$probe_dir"
   if (( result != 0 )); then
     warn "无法确认当前 Telemt 镜像支持独立上下行限速。现有部署未替换，请先通过“更新镜像”升级后重试。"
+    return 1
+  fi
+}
+
+verify_ad_tag_support() {
+  local staging="$1" probe_dir result=0
+  # A bogus value must fail with a type error; ignored tables are unsafe.
+  probe_dir="$(mktemp -d "$staging/tag-probe.XXXXXX")" || return 1
+  sed '/^\[access.user_ad_tags\]/a\
+"navomtp_type_probe" = 123
+' "$staging/config/telemt.toml" > "$probe_dir/config.toml"
+  if telemt_config_check "$probe_dir/config.toml" > "$probe_dir/output" 2>&1; then
+    result=1
+  elif ! grep -Eq 'invalid type.*integer|expected.*string' "$probe_dir/output"; then
+    result=1
+  fi
+  rm -rf -- "$probe_dir"
+  if (( result != 0 )); then
+    warn "无法确认镜像支持每组 ad_tag；请通过“更新镜像”升级后重试。"
     return 1
   fi
 }
@@ -586,7 +731,8 @@ verify_images_and_staging() {
     warn "Telemt 配置验证失败；若设置了限速，请通过“更新镜像”升级后重试。"
     return 1
   fi
-  verify_rate_limit_support "$staging"
+  verify_rate_limit_support "$staging" || return 1
+  verify_ad_tag_support "$staging"
 }
 
 backup_current() {
@@ -641,9 +787,11 @@ wait_for_healthy() {
 }
 
 extract_base_link() {
-  local deadline=$((SECONDS + 30)) link
+  local deadline=$((SECONDS + 30)) link secret="${1:-}" domain_hex
+  domain_hex="$(printf '%s' "$TLS_DOMAIN" | od -An -tx1 | tr -d ' \n')"
   while (( SECONDS < deadline )); do
-    link="$(compose logs --no-color telemt 2>/dev/null | grep -Eo "tg://proxy\\?[^[:space:]\"']+" | head -n 1 || true)"
+    link="$(compose logs --no-color telemt 2>/dev/null | grep -Eo "tg://proxy\\?[^[:space:]\"']+" | \
+      grep -E "[?&]secret=ee${secret}${domain_hex}(&|$)" | tail -n 1 || true)"
     if [[ -n "$link" ]]; then
       printf '%s' "$link"
       return 0
@@ -654,20 +802,26 @@ extract_base_link() {
 }
 
 write_links() {
-  local base_link port tg_link https_link query
-  base_link="$(extract_base_link)" || {
-    warn "未能从 Telemt 日志取得官方生成链接；可稍后选择「显示连接链接」重试。"
-    return 0
-  }
-  : > "$INSTALL_DIR/links.txt"
-  chmod 0600 "$INSTALL_DIR/links.txt"
+  local base_link port tg_link https_link query i secret output
+  output="$(mktemp "$INSTALL_DIR/links.XXXXXX")" || return 1
+  chmod 0600 "$output"
   ports_to_array "$PUBLIC_PORTS"
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    secret="$(group_value SECRET "$i")"
+    base_link="$(extract_base_link "$secret")" || {
+      rm -f -- "$output" "$INSTALL_DIR/links.txt"
+      warn "未取得组 $((i+1)) 的官方 FakeTLS 链接；请稍后通过「显示连接链接」重试。"
+      return 0
+    }
+    printf '连接组 %s | ad_tag：%s\n' "$((i+1))" "$(group_value TAG "$i")" >> "$output"
   for port in "${PORT_ARRAY[@]}"; do
     tg_link="$(sed -E "s/([?&]port=)[0-9]+/\\1${port}/" <<< "$base_link")"
     query="${tg_link#*\?}"
     https_link="https://t.me/proxy?${query}"
-    printf '端口 %s\n%s\n%s\n\n' "$port" "$tg_link" "$https_link" >> "$INSTALL_DIR/links.txt"
+    printf '端口 %s\n%s\n%s\n\n' "$port" "$tg_link" "$https_link" >> "$output"
   done
+  done
+  mv -f -- "$output" "$INSTALL_DIR/links.txt"
 }
 
 record_image_digests() {
@@ -695,7 +849,7 @@ maybe_configure_ufw() {
 deploy_configuration() {
   local staging backup_dir had_previous=0 timestamp
   staging="$(mktemp -d /tmp/navomtp-stage.XXXXXX)"
-  create_staging_tree "$staging"
+  create_staging_tree "$staging" || { rm -rf -- "$staging"; die "连接组配置无效，未修改现有部署。"; }
   if ! verify_images_and_staging "$staging"; then
     rm -rf -- "$staging"
     die "候选配置或容器镜像验证失败，未修改现有部署。"
@@ -739,9 +893,8 @@ install_or_configure() {
   install_base_dependencies
   ensure_docker
   collect_configuration || { log "已取消。"; return 0; }
-  local summary adtag_summary
-  adtag_summary="${AD_TAG:-未设置}"
-  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\nad_tag：$adtag_summary\n伪装域名：$TLS_DOMAIN\n上行：$(rate_limit_label "$UPLOAD_LIMIT_MBPS")\n下行：$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")\n（所有客户端及端口共享）\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
+  local summary
+  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\n伪装域名：$TLS_DOMAIN\n$(group_summary)\n每组独立限速，组内所有客户端及端口共享。\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
   dialog_yesno "确认部署" "$summary" || { log "已取消。"; return 0; }
   deploy_configuration
 }
@@ -759,6 +912,8 @@ load_state() {
   AD_TAG="$(state_value AD_TAG || true)"
   TLS_DOMAIN="$(state_value TLS_DOMAIN)"
   load_rate_limits || die "保存的限速值无效，请检查 state.env。"
+  load_groups && validate_groups || die "保存的连接组配置无效，请检查 state.env。"
+  sync_first_group
   NETWORK_SUBNET="$(state_value NETWORK_SUBNET)"
   NGINX_IP="$(state_value NGINX_IP)"
   TELEMT_IP="$(state_value TELEMT_IP)"
@@ -773,9 +928,9 @@ show_status() {
   printf '\n镜像摘要：\n'
   [[ ! -f "$INSTALL_DIR/image-digests.txt" ]] || sed -n '1,3p' "$INSTALL_DIR/image-digests.txt"
   printf '\n公开 TCP 端口：%s\n' "$(state_value PUBLIC_PORTS)"
-  load_rate_limits || die "保存的限速值无效，请检查 state.env。"
-  printf '上行限速：%s\n下行限速：%s\n（所有客户端及公开端口共享）\n' \
-    "$(rate_limit_label "$UPLOAD_LIMIT_MBPS")" "$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")"
+  load_groups && validate_groups || die "保存的连接组配置无效，请检查 state.env。"
+  group_summary
+  printf '每组独立限速；组内所有客户端及公开端口共享。\n'
   printf '云厂商安全组需单独确认。\n'
 }
 

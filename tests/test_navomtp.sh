@@ -152,11 +152,12 @@ DOWNLOAD_LIMIT_MBPS=999
 load_state
 assert_equal "load saved upload" 0 "$UPLOAD_LIMIT_MBPS"
 assert_equal "load saved download" 8 "$DOWNLOAD_LIMIT_MBPS"
-sed '/^UPLOAD_LIMIT_MBPS=/d; /^DOWNLOAD_LIMIT_MBPS=/d' "$INSTALL_DIR/state.env" > "$tmp_dir/old-state.env"
+sed '/^UPLOAD_LIMIT_MBPS=/d; /^DOWNLOAD_LIMIT_MBPS=/d; /^GROUP_/d' "$INSTALL_DIR/state.env" > "$tmp_dir/old-state.env"
 cp "$tmp_dir/old-state.env" "$INSTALL_DIR/state.env"
 load_state
 assert_equal "legacy upload defaults unlimited" 0 "$UPLOAD_LIMIT_MBPS"
 assert_equal "legacy download defaults unlimited" 0 "$DOWNLOAD_LIMIT_MBPS"
+unset GROUP_COUNT
 
 # The compatibility probe must catch silent ignores, either unsupported
 # direction, and unrelated failures rather than treating any error as support.
@@ -208,8 +209,8 @@ test_rate_wizard() (
   dialog_input() {
     printf '%s\n' "$1" >> "$tmp_dir/prompts"
     case "$1" in
-      '上行限速（客户端 → Telegram）') [[ "$3" == 12 ]] || return 1 ;;
-      '下行限速（Telegram → 客户端）') [[ "$3" == 34 ]] || return 1 ;;
+      '组 1：上行限速（客户端 → Telegram）') [[ "$3" == 12 ]] || return 1 ;;
+      '组 1：下行限速（Telegram → 客户端）') [[ "$3" == 34 ]] || return 1 ;;
       'Telemt 用户') return 1 ;;
     esac
     printf '%s' "$3"
@@ -219,7 +220,7 @@ test_rate_wizard() (
   select_network() { printf '%s' '172.29.241.0/24'; }
   collect_configuration || return 1
   [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]] || return 1
-  [[ "$(tail -n 3 "$tmp_dir/prompts")" == $'伪装域名\n上行限速（客户端 → Telegram）\n下行限速（Telegram → 客户端）' ]]
+  [[ "$(tail -n 2 "$tmp_dir/prompts")" == $'组 1：上行限速（客户端 → Telegram）\n组 1：下行限速（Telegram → 客户端）' ]]
 )
 assert_success "wizard restores rates after domain without user prompt" test_rate_wizard
 
@@ -280,6 +281,140 @@ assert_contains "second tg link uses second public port" "$INSTALL_DIR/links.txt
 assert_contains "https link generated from official tg link" "$INSTALL_DIR/links.txt" 'https://t.me/proxy?server=proxy.example.com&port=32332&secret=ee'
 mode_links="$(stat -c '%a' "$INSTALL_DIR/links.txt" 2>/dev/null || stat -f '%Lp' "$INSTALL_DIR/links.txt")"
 assert_equal "links file mode" "600" "$mode_links"
+
+test_multi_groups() (
+  local scenario="$1" first second domain_hex original
+  # Restore actual implementations after the earlier log-link stub.
+  source "$ROOT_DIR/navomtp.sh"
+  INSTALL_DIR="$tmp_dir/multi-$scenario"
+  first=11111111111111111111111111111111
+  second=22222222222222222222222222222222
+  GROUP_COUNT=2
+  GROUP_USERS=(navo navo_2)
+  GROUP_SECRETS=("$first" "$second")
+  GROUP_TAGS=(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '')
+  GROUP_UP=(0 12)
+  GROUP_DOWN=(0 34)
+  sync_first_group
+  create_staging_tree "$INSTALL_DIR" || return 1
+  case "$scenario" in
+    render)
+      grep -Fq '"navo_2" = "22222222222222222222222222222222"' "$INSTALL_DIR/config/telemt.toml" || return 1
+      grep -Fq '"navo" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$INSTALL_DIR/config/telemt.toml" || return 1
+      grep -Fq '"navo_2" = { up_bps = 12000000, down_bps = 34000000 }' "$INSTALL_DIR/config/telemt.toml" || return 1
+      ! grep -q '^ad_tag =' "$INSTALL_DIR/config/telemt.toml" ;;
+    tags)
+      GROUP_TAGS[1]=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      render_telemt_config "$INSTALL_DIR/config/telemt.toml" || return 1
+      grep -Fq '"navo_2" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$INSTALL_DIR/config/telemt.toml" ;;
+    roundtrip)
+      original="$(<"$INSTALL_DIR/config/telemt.toml")"
+      GROUP_TAGS=() GROUP_SECRETS=() GROUP_UP=() GROUP_DOWN=()
+      load_state || return 1
+      render_telemt_config "$INSTALL_DIR/reloaded.toml" || return 1
+      [[ "$(<"$INSTALL_DIR/reloaded.toml")" == "$original" ]] ;;
+    duplicate)
+      GROUP_SECRETS=(abcdefabcdefabcdefabcdefabcdefab ABCDEFABCDEFABCDEFABCDEFABCDEFAB)
+      ! validate_groups ;;
+    invalid-tag) GROUP_TAGS[1]='bad"tag'; ! validate_groups ;;
+    invalid-user) GROUP_USERS[1]='bad"user'; ! validate_groups ;;
+    duplicate-user) GROUP_USERS[1]=navo; ! validate_groups ;;
+    invalid-count) GROUP_COUNT=0; ! validate_groups ;;
+    legacy)
+      sed '/^GROUP_/d' "$INSTALL_DIR/state.env" > "$INSTALL_DIR/legacy.env"
+      cp "$INSTALL_DIR/legacy.env" "$INSTALL_DIR/state.env"
+      load_state || return 1
+      [[ "$GROUP_COUNT" == 1 && "${GROUP_SECRETS[0]}" == "$first" && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] ;;
+    later-group-rate)
+      telemt_config_check() { printf 'invalid type: string, expected u64\n' >&2; return 1; }
+      verify_rate_limit_support "$INSTALL_DIR" ;;
+    tag-support)
+      telemt_config_check() {
+        grep -q '"navomtp_type_probe" = 123' "$1" || return 0
+        printf 'invalid type: integer, expected string\n' >&2
+        return 1
+      }
+      verify_ad_tag_support "$INSTALL_DIR" ;;
+    ignored-tags)
+      telemt_config_check() { return 0; }
+      ! verify_ad_tag_support "$INSTALL_DIR" ;;
+    links|missing-link)
+      domain_hex="$(printf '%s' "$TLS_DOMAIN" | od -An -tx1 | tr -d ' \n')"
+      compose() {
+        printf 'tg://proxy?server=proxy.example.com&port=12432&secret=dd%s\n' "$first"
+        printf 'tg://proxy?server=proxy.example.com&port=12432&secret=ee%s%s\n' "$second" "$domain_hex"
+        printf 'tg://proxy?server=proxy.example.com&port=12432&secret=ee%s%s\n' "$first" "$domain_hex"
+      }
+      if [[ "$scenario" == missing-link ]]; then
+        extract_base_link() { [[ "$1" == "$first" ]] || return 1; printf 'tg://proxy?server=x&port=1&secret=ee%s' "$1"; }
+        write_links || return 1
+        [[ ! -e "$INSTALL_DIR/links.txt" ]]
+      else
+        PUBLIC_PORTS=12432,22124
+        write_links || return 1
+        [[ "$(grep -c '^tg://' "$INSTALL_DIR/links.txt")" == 4 ]] || return 1
+        [[ "$(grep -c '^https://' "$INSTALL_DIR/links.txt")" == 4 ]] || return 1
+        grep -Fq "port=22124&secret=ee$second$domain_hex" "$INSTALL_DIR/links.txt" || return 1
+        grep -Fq "port=22124&secret=ee$first$domain_hex" "$INSTALL_DIR/links.txt" || return 1
+        ! grep -q 'secret=dd' "$INSTALL_DIR/links.txt"
+      fi ;;
+    rollback)
+      original="$(<"$INSTALL_DIR/state.env")"
+      backup_current "$INSTALL_DIR/backup"
+      GROUP_COUNT=1
+      render_state "$INSTALL_DIR/state.env"
+      render_telemt_config "$INSTALL_DIR/config/telemt.toml"
+      restore_backup "$INSTALL_DIR/backup" || return 1
+      load_state || return 1
+      [[ "$GROUP_COUNT" == 2 && "$(<"$INSTALL_DIR/state.env")" == "$original" ]] ;;
+    update)
+      original="$(<"$INSTALL_DIR/state.env")"
+      require_root() { return 0; }
+      require_supported_host() { return 0; }
+      install_base_dependencies() { return 0; }
+      ensure_docker() { return 0; }
+      dialog_yesno() { return 0; }
+      docker() { printf 'test-image'; }
+      compose() { return 0; }
+      verify_images_and_staging() { [[ "$GROUP_COUNT" == 2 && "${GROUP_UP[1]}" == 12 && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]; }
+      wait_for_healthy() { return 0; }
+      record_image_digests() { return 0; }
+      write_links() { return 0; }
+      update_images || return 1
+      [[ "$(<"$INSTALL_DIR/state.env")" == "$original" ]] ;;
+    wizard-add|wizard-remove|wizard-cancel)
+      original="$(<"$INSTALL_DIR/state.env")"
+      dialog_input() {
+        case "$1" in
+          '连接组数量') if [[ "$scenario" == wizard-add ]]; then printf 3; else printf 1; fi ;;
+          '组 3：访问密钥') printf 33333333333333333333333333333333 ;;
+          '组 3：广告标签') printf cccccccccccccccccccccccccccccccc ;;
+          *) printf '%s' "$3" ;;
+        esac
+      }
+      dialog_yesno() { [[ "$scenario" != wizard-cancel ]]; }
+      check_ports_available() { return 0; }
+      probe_camouflage_domain() { return 0; }
+      select_network() { printf '172.29.241.0/24'; }
+      if [[ "$scenario" == wizard-cancel ]]; then
+        if collect_configuration; then return 1; fi
+        [[ "$(<"$INSTALL_DIR/state.env")" == "$original" ]]
+      else
+        collect_configuration || return 1
+        [[ "${GROUP_SECRETS[0]}" == "$first" ]] || return 1
+        render_telemt_config "$INSTALL_DIR/new.toml" || return 1
+        if [[ "$scenario" == wizard-add ]]; then
+          [[ "$GROUP_COUNT" == 3 && "${GROUP_TAGS[2]}" == cccccccccccccccccccccccccccccccc ]]
+        else
+          [[ "$GROUP_COUNT" == 1 ]] || return 1
+          ! grep -q 'navo_2' "$INSTALL_DIR/new.toml"
+        fi
+      fi ;;
+  esac
+)
+for scenario in render tags roundtrip duplicate invalid-tag invalid-user duplicate-user invalid-count legacy later-group-rate tag-support ignored-tags links missing-link rollback update wizard-add wizard-remove wizard-cancel; do
+  assert_success "multi-group $scenario" test_multi_groups "$scenario"
+done
 
 printf '1..%d\n' "$((pass + fail))"
 (( fail == 0 ))
