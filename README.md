@@ -16,7 +16,7 @@ Discover more Navo projects, products, and updates on the [official Navo website
 | --- | --- |
 | One-click Telemt setup | Detects Docker and installs Docker Engine plus the Compose plugin from Docker's official apt repository when missing |
 | Interactive terminal UI | Configures the public address, multiple ports, secret, optional `ad_tag`, and FakeTLS camouflage domain |
-| Multiple promotion tags | Each connection group has its own secret, `ad_tag`, links, and independent upload/download limits; no username input |
+| Multiple promotion tags | Each connection group has its own secret, `ad_tag`, and links; all groups share the overall upload/download limits; no username input |
 | Nginx SNI routing | Uses `stream` and `ssl_preread` to forward only the configured camouflage-domain traffic to Telemt |
 | Multiple MTProxy ports | Exposes one Telemt instance through multiple public TCP ports and creates a connection link for each port |
 | Reduced exposure | Publishes only Nginx ports; Telemt `9443`, Metrics, and the Control API remain private |
@@ -70,9 +70,12 @@ The terminal wizard asks for:
 2. One or more TCP ports, such as `443,12432,22124`;
 3. A FakeTLS camouflage domain, such as `www.microsoft.com`;
 4. The number of connection groups (`1–100`, default `1`);
-5. For each group: a unique 32-character hexadecimal secret (leave empty to generate), an optional `ad_tag`, and separate upload/download limits in integer Mbps (`0–100000`; `0` means unlimited).
+5. For each group: a unique 32-character hexadecimal secret (leave empty to generate) and an optional `ad_tag`;
+6. Overall upload/download limits in integer Mbps (`0–100000`; `0` means unlimited).
 
-Upload means client → Telegram; download means Telegram → client. All clients and public ports sharing the proxy secret share each direction's total limit. For example, upload `10` and download `25` set independent totals of 10 Mbps and 25 Mbps (1 Mbps = 1,000,000 bits/s, not 1 MB/s). These are sustained average limits with bounded bursts.
+Upload means client → Telegram; download means Telegram → client. All groups, secrets, clients, and public ports share one total limit per direction. For example, upload `10` and download `25` cap the combined proxy traffic at 10 Mbps upload and 25 Mbps download (1 Mbps = 1,000,000 bits/s, not 1 MB/s). These are sustained average limits with bounded bursts.
+
+The current IPv4 ingress uses one native Telemt `[access.cidr_rate_limits]` bucket for `0.0.0.0/0`, rather than separate user limits. IPv6 ingress is not configured; adding it requires revisiting the shared bucket rather than assigning a second independent budget. Only authenticated proxy traffic is counted, not unrelated services on the host.
 
 Both limits default to unlimited, including existing deployments without saved limits. Run `sudo bash navomtp.sh configure` to change them or enter `0` to remove either limit; `status` displays both. Image updates preserve the settings. If the current Telemt image does not recognize the limit fields, validation stops before replacing the deployment; use the existing `update` command to upgrade and retry.
 
@@ -80,11 +83,13 @@ After deployment, NavoMTP prints `tg://proxy` and `https://t.me/proxy` links for
 
 ### Multiple ad tags and connection groups
 
-Run `sudo bash navomtp.sh configure`, increase the group count, then set each group's secret, `ad_tag`, and limits. Each group gets separate links for every public port, while all groups use the same Telemt instance and camouflage domain. Limits are independent between groups; within a group, clients and ports share each directional limit. Internal identifiers are generated automatically.
+Run `sudo bash navomtp.sh configure`, increase the group count, then set each group's secret and `ad_tag`. Each group gets separate links for every public port, while all groups use the same Telemt instance, camouflage domain, and overall directional limits. Configure the two limits once after entering all groups. Internal identifiers are generated automatically.
 
 Tags are stored in Telemt's native `[access.user_ad_tags]`, not a comma-separated global `ad_tag`. A blank tag means no promotion for that group, without inheriting another group's tag. Register each group's secret with `@MTProxybot` to obtain its tag. Use the matching group links when sharing a promotion channel.
 
 Existing single-group installations become group 1 with their secret, tag, and limits preserved. Reconfiguration keeps each existing group's defaults; new groups generate independent secrets. Reducing the group count removes the trailing groups after confirmation and invalidates their links. Image updates retain all groups; failed deployments restore the previous configuration. `status` lists each group, and `links` shows all group/port combinations.
+
+To migrate an older per-group deployment, run `configure`: the former group 1 limits are offered as the overall defaults for confirmation. Other per-group limits are removed from the new configuration. Updating the script or images alone does not rewrite a live per-group configuration; `status` indicates that reconfiguration is required.
 
 ## Management Commands
 

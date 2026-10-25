@@ -128,7 +128,7 @@ load_rate_limits() {
   DOWNLOAD_LIMIT_MBPS="$(normalize_rate_mbps "${download:-0}")" || return 1
 }
 
-# Legacy scalar values remain a read-compatible view of the first group.
+# Legacy secret/tag scalars remain a read-compatible view of the first group.
 group_value() {
   local field="$1" index="$2"
   if [[ -n "${GROUP_COUNT:-}" ]]; then
@@ -136,32 +136,27 @@ group_value() {
       USER) printf '%s' "${GROUP_USERS[$index]}" ;;
       SECRET) printf '%s' "${GROUP_SECRETS[$index]}" ;;
       TAG) printf '%s' "${GROUP_TAGS[$index]}" ;;
-      UP) printf '%s' "${GROUP_UP[$index]}" ;;
-      DOWN) printf '%s' "${GROUP_DOWN[$index]}" ;;
     esac
   else
     case "$field" in
       USER) printf '%s' "${TELEMT_USER:-navo}" ;;
       SECRET) printf '%s' "${TELEMT_SECRET:-}" ;;
       TAG) printf '%s' "${AD_TAG:-}" ;;
-      UP) printf '%s' "${UPLOAD_LIMIT_MBPS:-0}" ;;
-      DOWN) printf '%s' "${DOWNLOAD_LIMIT_MBPS:-0}" ;;
     esac
   fi
 }
 
 load_groups() {
-  local count i key value
+  local count i key
   count="$(state_value GROUP_COUNT 2>/dev/null || true)"
-  GROUP_USERS=() GROUP_SECRETS=() GROUP_TAGS=() GROUP_UP=() GROUP_DOWN=()
+  GROUP_USERS=() GROUP_SECRETS=() GROUP_TAGS=()
+  load_rate_limits || return 1
   if [[ -z "$count" ]]; then
     GROUP_COUNT=1
     GROUP_USERS[0]="$(state_value TELEMT_USER 2>/dev/null || true)"
     GROUP_USERS[0]="${GROUP_USERS[0]:-navo}"
     GROUP_SECRETS[0]="$(state_value TELEMT_SECRET 2>/dev/null || true)"
     GROUP_TAGS[0]="$(state_value AD_TAG 2>/dev/null || true)"
-    load_rate_limits || return 1
-    GROUP_UP[0]="$UPLOAD_LIMIT_MBPS" GROUP_DOWN[0]="$DOWNLOAD_LIMIT_MBPS"
   else
     [[ "$count" =~ ^[1-9][0-9]{0,2}$ ]] && (( count <= 100 )) || return 1
     GROUP_COUNT="$count"
@@ -170,10 +165,6 @@ load_groups() {
       GROUP_USERS[i]="$(state_value "${key}_USER")"
       GROUP_SECRETS[i]="$(state_value "${key}_SECRET")"
       GROUP_TAGS[i]="$(state_value "${key}_TAG")"
-      value="$(state_value "${key}_UPLOAD_MBPS")"
-      GROUP_UP[i]="$(normalize_rate_mbps "$value")" || return 1
-      value="$(state_value "${key}_DOWNLOAD_MBPS")"
-      GROUP_DOWN[i]="$(normalize_rate_mbps "$value")" || return 1
     done
   fi
   for ((i=0; i<GROUP_COUNT; i++)); do
@@ -193,23 +184,18 @@ validate_groups() {
     secret="$(lowercase "$secret")"
     [[ "$seen_users" != *"|$user|"* && "$seen_secrets" != *"|$secret|"* ]] || return 1
     seen_users+="$user|" seen_secrets+="$secret|"
-    normalize_rate_mbps "$(group_value UP "$i")" >/dev/null || return 1
-    normalize_rate_mbps "$(group_value DOWN "$i")" >/dev/null || return 1
   done
 }
 
 sync_first_group() {
   TELEMT_USER="${GROUP_USERS[0]}" TELEMT_SECRET="${GROUP_SECRETS[0]}" AD_TAG="${GROUP_TAGS[0]}"
-  UPLOAD_LIMIT_MBPS="${GROUP_UP[0]}" DOWNLOAD_LIMIT_MBPS="${GROUP_DOWN[0]}"
 }
 
 group_summary() {
   local i tag
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
     tag="$(group_value TAG "$i")"
-    printf '组 %s | ad_tag：%s | 上行：%s | 下行：%s\n' "$((i+1))" \
-      "${tag:-未设置}" \
-      "$(rate_limit_label "$(group_value UP "$i")")" "$(rate_limit_label "$(group_value DOWN "$i")")"
+    printf '组 %s | ad_tag：%s\n' "$((i+1))" "${tag:-未设置}"
   done
 }
 
@@ -365,7 +351,7 @@ collect_configuration() {
 
   local i j old_count="$GROUP_COUNT" duplicate direction current_rate rate_title candidate_counter
   while :; do
-    value="$(dialog_input "连接组数量" "每组独立密钥、ad_tag 和限速，共用端口。填写 1–100；减少数量将删除末尾组：" "$GROUP_COUNT")" || return 1
+    value="$(dialog_input "连接组数量" "每组独立密钥和 ad_tag，共用端口及整体限速。填写 1–100；减少数量将删除末尾组：" "$GROUP_COUNT")" || return 1
     if [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( 10#$value >= 1 && 10#$value <= 100 )); then
       normalized=$((10#$value))
       if (( normalized < old_count )); then
@@ -403,20 +389,20 @@ collect_configuration() {
       if [[ -z "$value" ]] || validate_hex32 "$value"; then GROUP_TAGS[i]="$(lowercase "$value")"; break; fi
       dialog_message "输入错误" "ad_tag 必须留空或为 32 位十六进制。"
     done
-    for direction in UP DOWN; do
+  done
+  for direction in UP DOWN; do
       if [[ "$direction" == UP ]]; then
-        current_rate="${GROUP_UP[$i]:-0}" rate_title="上行限速（客户端 → Telegram）"
+        current_rate="$UPLOAD_LIMIT_MBPS" rate_title="整体上行限速（客户端 → Telegram）"
       else
-        current_rate="${GROUP_DOWN[$i]:-0}" rate_title="下行限速（Telegram → 客户端）"
+        current_rate="$DOWNLOAD_LIMIT_MBPS" rate_title="整体下行限速（Telegram → 客户端）"
       fi
     while :; do
-      value="$(dialog_input "组 $((i+1))：$rate_title" "本组所有客户端及公开端口共享；整数 Mbps，0–100000，0 不限速：" "$current_rate")" || return 1
+      value="$(dialog_input "$rate_title" "所有组、客户端及公开端口共享；整数 Mbps，0–100000，0 不限速：" "$current_rate")" || return 1
       if normalized="$(normalize_rate_mbps "$value")"; then
-        if [[ "$direction" == UP ]]; then GROUP_UP[i]="$normalized"; else GROUP_DOWN[i]="$normalized"; fi
+        if [[ "$direction" == UP ]]; then UPLOAD_LIMIT_MBPS="$normalized"; else DOWNLOAD_LIMIT_MBPS="$normalized"; fi
         break
       fi
       dialog_message "输入错误" "限速必须是 0–100000 的整数 Mbps，0 表示不限速。"
-    done
     done
   done
   sync_first_group
@@ -434,8 +420,10 @@ collect_configuration() {
 }
 
 render_telemt_config() {
-  local destination="$1" first_port upload download i user tag
+  local destination="$1" first_port upload download i tag
   validate_groups || return 1
+  upload="$(normalize_rate_mbps "${UPLOAD_LIMIT_MBPS:-0}")" || return 1
+  download="$(normalize_rate_mbps "${DOWNLOAD_LIMIT_MBPS:-0}")" || return 1
   first_port="${PUBLIC_PORTS%%,*}"
   cat > "$destination" <<EOF
 [general]
@@ -479,17 +467,12 @@ EOF
     tag="$(group_value TAG "$i")"
     [[ -z "$tag" ]] || printf '"%s" = "%s"\n' "$(group_value USER "$i")" "$tag" >> "$destination"
   done
-  local rate_header=0
-  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
-    user="$(group_value USER "$i")"
-    upload="$(normalize_rate_mbps "$(group_value UP "$i")")" || return 1
-    download="$(normalize_rate_mbps "$(group_value DOWN "$i")")" || return 1
   if (( upload > 0 || download > 0 )); then
-    if (( rate_header == 0 )); then printf '\n[access.user_rate_limits]\n' >> "$destination"; rate_header=1; fi
-    printf '"%s" = { up_bps = %s, down_bps = %s }\n' \
-      "$user" "$((upload * 1000000))" "$((download * 1000000))" >> "$destination"
+    # Public Nginx listeners and the Telemt listener are IPv4-only. All
+    # authenticated sources, across all secrets, share this ONE CIDR bucket.
+    printf '\n[access.cidr_rate_limits]\n"0.0.0.0/0" = { up_bps = %s, down_bps = %s }\n' \
+      "$((upload * 1000000))" "$((download * 1000000))" >> "$destination"
   fi
-  done
 }
 
 render_nginx_config() {
@@ -641,6 +624,7 @@ AD_TAG=${AD_TAG}
 TLS_DOMAIN=${TLS_DOMAIN}
 UPLOAD_LIMIT_MBPS=${UPLOAD_LIMIT_MBPS:-0}
 DOWNLOAD_LIMIT_MBPS=${DOWNLOAD_LIMIT_MBPS:-0}
+RATE_LIMIT_SCOPE=global
 NETWORK_SUBNET=${NETWORK_SUBNET}
 NGINX_IP=${NGINX_IP}
 TELEMT_IP=${TELEMT_IP}
@@ -649,10 +633,9 @@ NGINX_IMAGE=${NGINX_IMAGE}
 EOF
   printf 'GROUP_COUNT=%s\n' "${GROUP_COUNT:-1}" >> "$destination"
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
-    printf 'GROUP_%s_USER=%s\nGROUP_%s_SECRET=%s\nGROUP_%s_TAG=%s\nGROUP_%s_UPLOAD_MBPS=%s\nGROUP_%s_DOWNLOAD_MBPS=%s\n' \
+    printf 'GROUP_%s_USER=%s\nGROUP_%s_SECRET=%s\nGROUP_%s_TAG=%s\n' \
       "$((i+1))" "$(group_value USER "$i")" "$((i+1))" "$(group_value SECRET "$i")" \
-      "$((i+1))" "$(group_value TAG "$i")" "$((i+1))" "$(group_value UP "$i")" \
-      "$((i+1))" "$(group_value DOWN "$i")" >> "$destination"
+      "$((i+1))" "$(group_value TAG "$i")" >> "$destination"
   done
 }
 
@@ -676,7 +659,7 @@ telemt_config_check() {
 
 verify_rate_limit_support() {
   local staging="$1" probe_dir field result=0
-  grep -q '^\[access.user_rate_limits\]' "$staging/config/telemt.toml" || return 0
+  grep -q '^\[access.cidr_rate_limits\]' "$staging/config/telemt.toml" || return 0
   probe_dir="$(mktemp -d "$staging/rate-probe.XXXXXX")" || return 1
   # A lenient old parser may silently ignore new keys. It must reject a wrong
   # type for EACH direction, in addition to accepting the real candidate.
@@ -691,7 +674,7 @@ verify_rate_limit_support() {
   done
   rm -rf -- "$probe_dir"
   if (( result != 0 )); then
-    warn "无法确认当前 Telemt 镜像支持独立上下行限速。现有部署未替换，请先通过“更新镜像”升级后重试。"
+    warn "无法确认当前 Telemt 镜像支持整体上下行聚合限速。现有部署未替换，请先通过“更新镜像”升级后重试。"
     return 1
   fi
 }
@@ -894,7 +877,7 @@ install_or_configure() {
   ensure_docker
   collect_configuration || { log "已取消。"; return 0; }
   local summary
-  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\n伪装域名：$TLS_DOMAIN\n$(group_summary)\n每组独立限速，组内所有客户端及端口共享。\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
+  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\n伪装域名：$TLS_DOMAIN\n$(group_summary)\n整体上行：$(rate_limit_label "$UPLOAD_LIMIT_MBPS")\n整体下行：$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")\n所有组、客户端及端口共享总上限。\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
   dialog_yesno "确认部署" "$summary" || { log "已取消。"; return 0; }
   deploy_configuration
 }
@@ -930,7 +913,12 @@ show_status() {
   printf '\n公开 TCP 端口：%s\n' "$(state_value PUBLIC_PORTS)"
   load_groups && validate_groups || die "保存的连接组配置无效，请检查 state.env。"
   group_summary
-  printf '每组独立限速；组内所有客户端及公开端口共享。\n'
+  if grep -q '^\[access.user_rate_limits\]' "$INSTALL_DIR/config/telemt.toml"; then
+    printf '当前仍为旧版按组限速；运行 configure 切换为整体限速，默认沿用原第 1 组数值。\n'
+  else
+    printf '整体上行：%s\n整体下行：%s\n所有组、客户端及公开端口共享总上限。\n' \
+      "$(rate_limit_label "$UPLOAD_LIMIT_MBPS")" "$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")"
+  fi
   printf '云厂商安全组需单独确认。\n'
 }
 

@@ -108,7 +108,8 @@ TELEMT_IMAGE="$TELEMT_IMAGE_DEFAULT"
 NGINX_IMAGE="$NGINX_IMAGE_DEFAULT"
 
 create_staging_tree "$tmp_dir/stage"
-assert_not_contains "unlimited omits rate table" "$tmp_dir/stage/config/telemt.toml" '[access.user_rate_limits]'
+assert_not_contains "unlimited omits aggregate rate table" "$tmp_dir/stage/config/telemt.toml" '[access.cidr_rate_limits]'
+assert_not_contains "no per-group limiter" "$tmp_dir/stage/config/telemt.toml" '[access.user_rate_limits]'
 assert_contains "default upload state" "$tmp_dir/stage/state.env" 'UPLOAD_LIMIT_MBPS=0'
 assert_contains "default download state" "$tmp_dir/stage/state.env" 'DOWNLOAD_LIMIT_MBPS=0'
 assert_contains "telemt internal port" "$tmp_dir/stage/config/telemt.toml" 'port = 9443'
@@ -133,7 +134,7 @@ assert_equal "secret config mode" "600" "$mode_secret"
 UPLOAD_LIMIT_MBPS=10
 DOWNLOAD_LIMIT_MBPS=25
 render_telemt_config "$tmp_dir/rates.toml"
-assert_contains "independent Mbps conversion" "$tmp_dir/rates.toml" '"navo" = { up_bps = 10000000, down_bps = 25000000 }'
+assert_contains "aggregate Mbps conversion" "$tmp_dir/rates.toml" '"0.0.0.0/0" = { up_bps = 10000000, down_bps = 25000000 }'
 UPLOAD_LIMIT_MBPS=100000
 DOWNLOAD_LIMIT_MBPS=0
 render_telemt_config "$tmp_dir/rates.toml"
@@ -142,7 +143,7 @@ UPLOAD_LIMIT_MBPS=0
 DOWNLOAD_LIMIT_MBPS=8
 TELEMT_USER=legacy-user
 render_telemt_config "$tmp_dir/rates.toml"
-assert_contains "download only uses current user" "$tmp_dir/rates.toml" '"legacy-user" = { up_bps = 0, down_bps = 8000000 }'
+assert_contains "download aggregate independent of user" "$tmp_dir/rates.toml" '"0.0.0.0/0" = { up_bps = 0, down_bps = 8000000 }'
 TELEMT_USER="$TELEMT_USER_DEFAULT"
 
 INSTALL_DIR="$tmp_dir/state-tests"
@@ -209,8 +210,8 @@ test_rate_wizard() (
   dialog_input() {
     printf '%s\n' "$1" >> "$tmp_dir/prompts"
     case "$1" in
-      '组 1：上行限速（客户端 → Telegram）') [[ "$3" == 12 ]] || return 1 ;;
-      '组 1：下行限速（Telegram → 客户端）') [[ "$3" == 34 ]] || return 1 ;;
+      '整体上行限速（客户端 → Telegram）') [[ "$3" == 12 ]] || return 1 ;;
+      '整体下行限速（Telegram → 客户端）') [[ "$3" == 34 ]] || return 1 ;;
       'Telemt 用户') return 1 ;;
     esac
     printf '%s' "$3"
@@ -220,7 +221,7 @@ test_rate_wizard() (
   select_network() { printf '%s' '172.29.241.0/24'; }
   collect_configuration || return 1
   [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]] || return 1
-  [[ "$(tail -n 2 "$tmp_dir/prompts")" == $'组 1：上行限速（客户端 → Telegram）\n组 1：下行限速（Telegram → 客户端）' ]]
+  [[ "$(tail -n 2 "$tmp_dir/prompts")" == $'整体上行限速（客户端 → Telegram）\n整体下行限速（Telegram → 客户端）' ]]
 )
 assert_success "wizard restores rates after domain without user prompt" test_rate_wizard
 
@@ -293,15 +294,18 @@ test_multi_groups() (
   GROUP_USERS=(navo navo_2)
   GROUP_SECRETS=("$first" "$second")
   GROUP_TAGS=(aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '')
-  GROUP_UP=(0 12)
-  GROUP_DOWN=(0 34)
+  UPLOAD_LIMIT_MBPS=12
+  DOWNLOAD_LIMIT_MBPS=34
   sync_first_group
   create_staging_tree "$INSTALL_DIR" || return 1
   case "$scenario" in
     render)
       grep -Fq '"navo_2" = "22222222222222222222222222222222"' "$INSTALL_DIR/config/telemt.toml" || return 1
       grep -Fq '"navo" = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$INSTALL_DIR/config/telemt.toml" || return 1
-      grep -Fq '"navo_2" = { up_bps = 12000000, down_bps = 34000000 }' "$INSTALL_DIR/config/telemt.toml" || return 1
+      grep -Fq '"0.0.0.0/0" = { up_bps = 12000000, down_bps = 34000000 }' "$INSTALL_DIR/config/telemt.toml" || return 1
+      [[ "$(grep -c '^\[access.cidr_rate_limits\]' "$INSTALL_DIR/config/telemt.toml")" == 1 ]] || return 1
+      ! grep -q '^\[access.user_rate_limits\]' "$INSTALL_DIR/config/telemt.toml" || return 1
+      ! grep -q '^GROUP_.*_UPLOAD_MBPS=' "$INSTALL_DIR/state.env" || return 1
       ! grep -q '^ad_tag =' "$INSTALL_DIR/config/telemt.toml" ;;
     tags)
       GROUP_TAGS[1]=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -309,7 +313,7 @@ test_multi_groups() (
       grep -Fq '"navo_2" = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$INSTALL_DIR/config/telemt.toml" ;;
     roundtrip)
       original="$(<"$INSTALL_DIR/config/telemt.toml")"
-      GROUP_TAGS=() GROUP_SECRETS=() GROUP_UP=() GROUP_DOWN=()
+      GROUP_TAGS=() GROUP_SECRETS=()
       load_state || return 1
       render_telemt_config "$INSTALL_DIR/reloaded.toml" || return 1
       [[ "$(<"$INSTALL_DIR/reloaded.toml")" == "$original" ]] ;;
@@ -325,7 +329,39 @@ test_multi_groups() (
       cp "$INSTALL_DIR/legacy.env" "$INSTALL_DIR/state.env"
       load_state || return 1
       [[ "$GROUP_COUNT" == 1 && "${GROUP_SECRETS[0]}" == "$first" && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] ;;
-    later-group-rate)
+    global-migration)
+      sed '/^RATE_LIMIT_SCOPE=/d' "$INSTALL_DIR/state.env" > "$INSTALL_DIR/old.env"
+      printf 'GROUP_1_UPLOAD_MBPS=12\nGROUP_1_DOWNLOAD_MBPS=34\nGROUP_2_UPLOAD_MBPS=90\nGROUP_2_DOWNLOAD_MBPS=80\n' >> "$INSTALL_DIR/old.env"
+      cp "$INSTALL_DIR/old.env" "$INSTALL_DIR/state.env"
+      load_state || return 1
+      [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]] || return 1
+      sync_first_group
+      [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]] || return 1
+      create_staging_tree "$INSTALL_DIR/new" || return 1
+      grep -q '^RATE_LIMIT_SCOPE=global$' "$INSTALL_DIR/new/state.env" || return 1
+      ! grep -q '^GROUP_.*_UPLOAD_MBPS=' "$INSTALL_DIR/new/state.env" || return 1
+      grep -Fq '"0.0.0.0/0" = { up_bps = 12000000, down_bps = 34000000 }' "$INSTALL_DIR/new/config/telemt.toml" ;;
+    global-unlimited)
+      UPLOAD_LIMIT_MBPS=0 DOWNLOAD_LIMIT_MBPS=0
+      render_telemt_config "$INSTALL_DIR/unlimited.toml" || return 1
+      ! grep -q 'rate_limits' "$INSTALL_DIR/unlimited.toml" ;;
+    global-wizard)
+      dialog_input() {
+        printf '%s\n' "$1" >> "$INSTALL_DIR/prompts"
+        case "$1" in
+          '整体上行限速（客户端 → Telegram）') printf 5 ;;
+          '整体下行限速（Telegram → 客户端）') printf 9 ;;
+          *) printf '%s' "$3" ;;
+        esac
+      }
+      check_ports_available() { return 0; }
+      probe_camouflage_domain() { return 0; }
+      select_network() { printf '172.29.241.0/24'; }
+      collect_configuration || return 1
+      [[ "$UPLOAD_LIMIT_MBPS" == 5 && "$DOWNLOAD_LIMIT_MBPS" == 9 && "$GROUP_COUNT" == 2 ]] || return 1
+      [[ "$(grep -c '整体.*限速' "$INSTALL_DIR/prompts")" == 2 ]] || return 1
+      ! grep -q '组 .*限速' "$INSTALL_DIR/prompts" ;;
+    aggregate-rate)
       telemt_config_check() { printf 'invalid type: string, expected u64\n' >&2; return 1; }
       verify_rate_limit_support "$INSTALL_DIR" ;;
     tag-support)
@@ -376,7 +412,7 @@ test_multi_groups() (
       dialog_yesno() { return 0; }
       docker() { printf 'test-image'; }
       compose() { return 0; }
-      verify_images_and_staging() { [[ "$GROUP_COUNT" == 2 && "${GROUP_UP[1]}" == 12 && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]; }
+      verify_images_and_staging() { [[ "$GROUP_COUNT" == 2 && "$UPLOAD_LIMIT_MBPS" == 12 && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]; }
       wait_for_healthy() { return 0; }
       record_image_digests() { return 0; }
       write_links() { return 0; }
@@ -412,7 +448,7 @@ test_multi_groups() (
       fi ;;
   esac
 )
-for scenario in render tags roundtrip duplicate invalid-tag invalid-user duplicate-user invalid-count legacy later-group-rate tag-support ignored-tags links missing-link rollback update wizard-add wizard-remove wizard-cancel; do
+for scenario in render tags roundtrip duplicate invalid-tag invalid-user duplicate-user invalid-count legacy global-migration global-unlimited global-wizard aggregate-rate tag-support ignored-tags links missing-link rollback update wizard-add wizard-remove wizard-cancel; do
   assert_success "multi-group $scenario" test_multi_groups "$scenario"
 done
 
