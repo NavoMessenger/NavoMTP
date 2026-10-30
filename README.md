@@ -43,6 +43,19 @@ Nginx never forwards traffic to an arbitrary hostname supplied by a client, so t
 
 ## Requirements
 
+### Official image or local source build
+
+The installation/configuration wizard now asks for the Telemt image mode:
+
+- `official` (default): pull the saved registry image, normally `ghcr.io/telemt/telemt:latest`.
+- `source`: build from an absolute directory on **the proxy server**, using `Dockerfile.live-tag`. The directory must contain `Cargo.toml`, `Cargo.lock`, `src/main.rs`, and that Dockerfile. Upload the complete modified checkout first; a path on your laptop is not accessible to the server.
+
+For example, upload the patched source to `/root/NavoMTP/telemt`, run `sudo bash navomtp.sh configure`, select `source`, and enter that path. No registry push or manual state-file editing is needed. Do not use the upstream Dockerfile, which downloads a prebuilt release rather than compiling your changes.
+
+Source builds receive new local image tags; previous images are retained for rollback. The selected mode and source path persist in `state.env`. `update` pulls in official mode and rebuilds the saved local directory in source mode; it does **not** run `git pull`. Nginx remains a registry image. Reconfiguration (including rotation configuration) also builds the selected source. Automatic tag-rotation ticks do not build images.
+
+Compose uses the already validated Telemt image without implicit pulls. Switching modes uses the same candidate validation and rollback flow; failures restore prior configuration and running-image references. Existing deployments without a saved mode default to `official`. `status` shows the selected mode and source path. Local building needs enough disk/RAM and network access to build dependencies and base images; this is not an offline build.
+
 - Debian or Ubuntu with systemd;
 - `amd64` or `arm64` architecture;
 - root or sudo access;
@@ -199,6 +212,7 @@ Run local checks without Docker:
 bash -n navomtp.sh
 bash tests/test_navomtp.sh
 bash tests/test_rotation.sh
+bash tests/test_image_modes.sh
 shellcheck navomtp.sh tests/test_navomtp.sh
 ```
 

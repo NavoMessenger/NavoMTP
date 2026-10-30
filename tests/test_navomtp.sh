@@ -228,7 +228,7 @@ test_rate_wizard() (
   select_network() { printf '%s' '172.29.241.0/24'; }
   collect_configuration || return 1
   [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]] || return 1
-  [[ "$(tail -n 2 "$tmp_dir/prompts")" == $'整体上行限速（客户端 → Telegram）\n整体下行限速（Telegram → 客户端）' ]]
+  [[ "$(grep '^整体.*限速' "$tmp_dir/prompts")" == $'整体上行限速（客户端 → Telegram）\n整体下行限速（Telegram → 客户端）' ]]
 )
 assert_success "wizard restores rates after domain without user prompt" test_rate_wizard
 
@@ -250,6 +250,9 @@ test_rate_update() (
   wait_for_healthy() { return 0; }
   record_image_digests() { return 0; }
   write_links() { return 0; }
+  show_links() { return 0; }
+  maybe_configure_ufw() { return 0; }
+  install_staging() { cp -Rp "$1/." "$INSTALL_DIR/"; }
   update_images || return 1
   [[ "$(<"$INSTALL_DIR/config/telemt.toml")" == "$original" ]]
 )
@@ -423,6 +426,9 @@ test_multi_groups() (
       wait_for_healthy() { return 0; }
       record_image_digests() { return 0; }
       write_links() { return 0; }
+      show_links() { return 0; }
+      maybe_configure_ufw() { return 0; }
+      install_staging() { cp -Rp "$1/." "$INSTALL_DIR/"; }
       update_images || return 1
       [[ "$(<"$INSTALL_DIR/state.env")" == "$original" ]] ;;
     wizard-add|wizard-remove|wizard-cancel)

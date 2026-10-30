@@ -43,6 +43,19 @@ Nginx 不会按照客户端提供的任意域名转发，因此不会把服务�
 
 ## 系统要求
 
+### 官方镜像 / 本地源码构建
+
+安装及修改配置向导新增 Telemt 镜像模式：
+
+- `official`（默认）：拉取保存的仓库镜像，通常为 `ghcr.io/telemt/telemt:latest`。
+- `source`：从**代理服务器上的绝对路径**构建，使用 `Dockerfile.live-tag`；目录必须包含 `Cargo.toml`、`Cargo.lock`、`src/main.rs` 和该 Dockerfile。请先上传完整修改版源码，不能填写你电脑上的本地路径。
+
+例如，将修改版放到服务器 `/root/NavoMTP/telemt`，运行 `sudo bash navomtp.sh configure`，选择 `source`，填写该目录，即可编译部署，无需推送镜像仓库或手改状态文件。不要使用下载官方预编译程序的原 Dockerfile，否则不会包含本地源码修改。
+
+每次源码构建生成新的本地镜像标签，保留旧镜像供回滚。镜像模式和源码路径保存在 `state.env`；“更新镜像”在官方模式下拉取，在源码模式下重编译保存的目录，**不会自动执行 git pull**。Nginx 仍从仓库拉取。重新配置（包括轮换设置）也会构建所选源码；自动 tag 轮换任务不会触发构建。
+
+Compose 固定使用已校验的 Telemt 镜像，不隐式拉取。模式切换沿用候选校验与回滚流程，失败恢复旧配置和运行镜像引用。旧部署没有模式字段时按 `official` 处理。`status` 显示模式和源码路径。源码构建需要足够磁盘、内存及下载构建依赖和基础镜像的网络，并非离线构建。
+
 - Debian 或 Ubuntu，使用 systemd；
 - `amd64` 或 `arm64` 架构；
 - root 或 sudo 权限；
@@ -199,6 +212,7 @@ sudo bash navomtp.sh uninstall   # 删除本项目，不卸载 Docker
 bash -n navomtp.sh
 bash tests/test_navomtp.sh
 bash tests/test_rotation.sh
+bash tests/test_image_modes.sh
 shellcheck navomtp.sh tests/test_navomtp.sh
 ```
 

@@ -431,7 +431,7 @@ collect_configuration() {
     dialog_yesno "域名探测失败" "无法确认 $TLS_DOMAIN 的 DNS 或 443/TLS 可达性。继续可能导致 FakeTLS 不可用。是否仍然继续？" || return 1
   fi
 
-  TELEMT_IMAGE="$(state_value TELEMT_IMAGE 2>/dev/null || printf '%s' "$TELEMT_IMAGE_DEFAULT")"
+  collect_image_settings || return 1
   NGINX_IMAGE="$(state_value NGINX_IMAGE 2>/dev/null || printf '%s' "$NGINX_IMAGE_DEFAULT")"
   NETWORK_SUBNET="$(select_network)" || die "找不到可用的专用 Docker /24 网段。"
   NGINX_IP="$(network_ip "$NETWORK_SUBNET" 2)"
@@ -551,6 +551,7 @@ name: ${COMPOSE_PROJECT}
 services:
   telemt:
     image: ${TELEMT_IMAGE}
+    pull_policy: never
     container_name: navomtp-telemt
     restart: unless-stopped
     working_dir: /run/telemt
@@ -652,6 +653,8 @@ NETWORK_SUBNET=${NETWORK_SUBNET}
 NGINX_IP=${NGINX_IP}
 TELEMT_IP=${TELEMT_IP}
 TELEMT_IMAGE=${TELEMT_IMAGE}
+TELEMT_IMAGE_MODE=${TELEMT_IMAGE_MODE:-official}
+TELEMT_SOURCE_DIR=${TELEMT_SOURCE_DIR:-}
 NGINX_IMAGE=${NGINX_IMAGE}
 EOF
   printf 'GROUP_COUNT=%s\n' "${GROUP_COUNT:-1}" >> "$destination"
@@ -755,7 +758,11 @@ verify_ad_tag_support() {
 verify_images_and_staging() {
   local staging="$1" nginx_build
   log "拉取并验证容器镜像..."
-  docker pull "$TELEMT_IMAGE" || return 1
+  if [[ "${TELEMT_IMAGE_MODE:-official}" == source ]]; then
+    docker image inspect "$TELEMT_IMAGE" >/dev/null || return 1
+  else
+    docker pull "$TELEMT_IMAGE" || return 1
+  fi
   docker pull "$NGINX_IMAGE" || return 1
   nginx_build="$(docker run --rm "$NGINX_IMAGE" nginx -V 2>&1)" || return 1
   if [[ "$nginx_build" != *"--with-stream"* || "$nginx_build" != *"--with-stream_ssl_preread_module"* ]]; then
@@ -786,17 +793,17 @@ backup_current() {
 
 install_staging() {
   local staging="$1"
-  install -d -m 0700 "$INSTALL_DIR/config" "$INSTALL_DIR/nginx" "$INSTALL_DIR/backups"
-  install -m 0640 "$staging/config/telemt.toml" "$INSTALL_DIR/config/telemt.toml.new"
-  install -m 0644 "$staging/nginx/nginx.conf" "$INSTALL_DIR/nginx/nginx.conf.new"
-  install -m 0644 "$staging/compose.yaml" "$INSTALL_DIR/compose.yaml.new"
-  install -m 0600 "$staging/state.env" "$INSTALL_DIR/state.env.new"
-  chown 0:65532 "$INSTALL_DIR/config/telemt.toml.new"
+  install -d -m 0700 "$INSTALL_DIR/config" "$INSTALL_DIR/nginx" "$INSTALL_DIR/backups" || return 1
+  install -m 0640 "$staging/config/telemt.toml" "$INSTALL_DIR/config/telemt.toml.new" || return 1
+  install -m 0644 "$staging/nginx/nginx.conf" "$INSTALL_DIR/nginx/nginx.conf.new" || return 1
+  install -m 0644 "$staging/compose.yaml" "$INSTALL_DIR/compose.yaml.new" || return 1
+  install -m 0600 "$staging/state.env" "$INSTALL_DIR/state.env.new" || return 1
+  chown 0:65532 "$INSTALL_DIR/config/telemt.toml.new" || return 1
   prepare_telemt_config_directory "$INSTALL_DIR/config" || return 1
-  mv -f "$INSTALL_DIR/config/telemt.toml.new" "$INSTALL_DIR/config/telemt.toml"
-  mv -f "$INSTALL_DIR/nginx/nginx.conf.new" "$INSTALL_DIR/nginx/nginx.conf"
-  mv -f "$INSTALL_DIR/compose.yaml.new" "$INSTALL_DIR/compose.yaml"
-  mv -f "$INSTALL_DIR/state.env.new" "$INSTALL_DIR/state.env"
+  mv -f "$INSTALL_DIR/config/telemt.toml.new" "$INSTALL_DIR/config/telemt.toml" || return 1
+  mv -f "$INSTALL_DIR/nginx/nginx.conf.new" "$INSTALL_DIR/nginx/nginx.conf" || return 1
+  mv -f "$INSTALL_DIR/compose.yaml.new" "$INSTALL_DIR/compose.yaml" || return 1
+  mv -f "$INSTALL_DIR/state.env.new" "$INSTALL_DIR/state.env" || return 1
 }
 
 restore_backup() {
@@ -887,9 +894,12 @@ maybe_configure_ufw() {
 
 deploy_configuration() {
   local staging backup_dir had_previous=0 timestamp
+  snapshot_deployment_images
+  prepare_telemt_image || { restore_deployment_images; warn 'Telemt 镜像准备失败，保留现有部署。'; return 1; }
   staging="$(mktemp -d /tmp/navomtp-stage.XXXXXX)"
-  create_staging_tree "$staging" || { rm -rf -- "$staging"; die "连接组配置无效，未修改现有部署。"; }
+  create_staging_tree "$staging" || { restore_deployment_images; rm -rf -- "$staging"; die "连接组配置无效，未修改现有部署。"; }
   if ! verify_images_and_staging "$staging"; then
+    restore_deployment_images
     rm -rf -- "$staging"
     die "候选配置或容器镜像验证失败，未修改现有部署。"
   fi
@@ -900,7 +910,13 @@ deploy_configuration() {
     had_previous=1
     backup_current "$backup_dir"
   fi
-  install_staging "$staging"
+  if ! install_staging "$staging"; then
+    (( had_previous == 0 )) || restore_backup "$backup_dir"
+    restore_deployment_images
+    rm -rf -- "$staging"
+    warn '安装候选文件失败，已请求恢复原配置。'
+    return 1
+  fi
 
   log "启动 NavoMTP 服务..."
   if ! compose up -d --force-recreate --remove-orphans || ! wait_for_healthy || ! sync_rotation_timer; then
@@ -909,6 +925,7 @@ deploy_configuration() {
     if (( had_previous == 1 )); then
       warn "正在恢复上一版配置。"
       restore_backup "$backup_dir"
+      restore_deployment_images
       load_state
       sync_rotation_timer || warn '轮换定时器恢复失败，请检查 systemd。'
       compose up -d --force-recreate --remove-orphans || true
@@ -937,7 +954,7 @@ install_or_configure() {
   ensure_docker
   collect_configuration || { log "已取消。"; return 0; }
   local summary
-  summary="公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\n伪装域名：$TLS_DOMAIN\n$(group_summary)\n整体上行：$(rate_limit_label "$UPLOAD_LIMIT_MBPS")\n整体下行：$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")\n所有组、客户端及端口共享总上限。\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
+  summary="Telemt 镜像模式：${TELEMT_IMAGE_MODE:-official}\n源码目录：${TELEMT_SOURCE_DIR:-无}\n公网地址：$PUBLIC_HOST\n公网端口：$PUBLIC_PORTS\n伪装域名：$TLS_DOMAIN\n$(group_summary)\n整体上行：$(rate_limit_label "$UPLOAD_LIMIT_MBPS")\n整体下行：$(rate_limit_label "$DOWNLOAD_LIMIT_MBPS")\n所有组、客户端及端口共享总上限。\n\n仅启用 FakeTLS；错误或缺失 SNI 将被拒绝。"
   dialog_yesno "确认部署" "$summary" || { log "已取消。"; return 0; }
   deploy_configuration
 }
@@ -961,6 +978,7 @@ load_state() {
   NGINX_IP="$(state_value NGINX_IP)"
   TELEMT_IP="$(state_value TELEMT_IP)"
   TELEMT_IMAGE="$(state_value TELEMT_IMAGE)"
+  load_image_settings || die '保存的镜像模式无效，请检查 state.env。'
   NGINX_IMAGE="$(state_value NGINX_IMAGE)"
 }
 
@@ -968,6 +986,8 @@ show_status() {
   require_root
   require_installation
   compose ps
+  load_image_settings || die '保存的镜像模式无效，请检查 state.env。'
+  printf '\nTelemt 镜像模式：%s\n源码目录：%s\n' "$TELEMT_IMAGE_MODE" "${TELEMT_SOURCE_DIR:-无}"
   printf '\n镜像摘要：\n'
   [[ ! -f "$INSTALL_DIR/image-digests.txt" ]] || sed -n '1,3p' "$INSTALL_DIR/image-digests.txt"
   printf '\n公开 TCP 端口：%s\n' "$(state_value PUBLIC_PORTS)"
@@ -1009,23 +1029,83 @@ update_images() {
   install_base_dependencies
   ensure_docker
   load_state
-  dialog_yesno "更新镜像" "将拉取 Telemt 与 Nginx 新镜像并重建容器。失败时会恢复原镜像。是否继续？" || return 0
-  local old_telemt_id old_nginx_id
-  old_telemt_id="$(docker image inspect "$TELEMT_IMAGE" --format '{{.Id}}')"
-  old_nginx_id="$(docker image inspect "$NGINX_IMAGE" --format '{{.Id}}')"
-  if ! compose pull || ! verify_images_and_staging "$INSTALL_DIR" || \
-    ! compose up -d --force-recreate --remove-orphans || ! wait_for_healthy; then
-    warn "镜像更新失败，恢复更新前镜像。"
-    docker tag "$old_telemt_id" "$TELEMT_IMAGE"
-    docker tag "$old_nginx_id" "$NGINX_IMAGE"
-    compose up -d --force-recreate --remove-orphans || true
-    wait_for_healthy || warn "原镜像未恢复到健康状态，请立即检查日志。"
-    return 1
-  fi
-  record_image_digests
-  write_links
-  sync_rotation_timer || return 1
+  dialog_yesno "更新镜像" "Telemt 模式：$TELEMT_IMAGE_MODE\n官方模式拉取镜像；源码模式重新构建保存的本地目录（不自动 git pull）。Nginx 拉取新镜像。校验后重建，失败恢复原配置与镜像。继续？" || return 0
+  deploy_configuration || return 1
   log "镜像更新完成。"
+}
+
+load_image_settings() {
+  TELEMT_IMAGE_MODE="$(state_value TELEMT_IMAGE_MODE 2>/dev/null || true)"
+  TELEMT_IMAGE_MODE="${TELEMT_IMAGE_MODE:-official}"
+  TELEMT_SOURCE_DIR="$(state_value TELEMT_SOURCE_DIR 2>/dev/null || true)"
+  [[ "$TELEMT_IMAGE_MODE" == official || "$TELEMT_IMAGE_MODE" == source ]]
+}
+
+validate_source_directory() {
+  local path="$1"
+  [[ "$path" == /* && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+  [[ -f "$path/Cargo.toml" && -f "$path/Cargo.lock" && -f "$path/src/main.rs" && -f "$path/Dockerfile.live-tag" ]]
+}
+
+collect_image_settings() {
+  local old_mode value default_source
+  load_image_settings || return 1
+  old_mode="$TELEMT_IMAGE_MODE"
+  while :; do
+    value="$(dialog_input 'Telemt 镜像来源' 'official：官方镜像；source：本地源码构建（使用 Dockerfile.live-tag，不拉取官方 Telemt）：' "$TELEMT_IMAGE_MODE")" || return 1
+    case "$value" in official|source) TELEMT_IMAGE_MODE="$value"; break ;; esac
+    dialog_message '输入错误' '请输入 official 或 source。'
+  done
+  if [[ "$TELEMT_IMAGE_MODE" == source ]]; then
+    default_source="${TELEMT_SOURCE_DIR:-$(dirname "$SCRIPT_SOURCE")/telemt}"
+    while :; do
+      value="$(dialog_input 'Telemt 源码目录' '填写本服务器源码绝对路径，必须包含 Cargo.toml、Cargo.lock、src/main.rs、Dockerfile.live-tag。不会下载或更新源码：' "$default_source")" || return 1
+      if validate_source_directory "$value"; then TELEMT_SOURCE_DIR="$(cd "$value" && pwd -P)"; break; fi
+      dialog_message '源码目录无效' '请上传完整的修改版源码，包含 Dockerfile.live-tag。不能使用仅下载官方二进制的原 Dockerfile。'
+    done
+    TELEMT_IMAGE="$(state_value TELEMT_IMAGE 2>/dev/null || true)"
+  else
+    TELEMT_SOURCE_DIR=''
+    TELEMT_IMAGE="$TELEMT_IMAGE_DEFAULT"
+    if [[ "$old_mode" == official ]]; then
+      value="$(state_value TELEMT_IMAGE 2>/dev/null || true)"
+      TELEMT_IMAGE="${value:-$TELEMT_IMAGE_DEFAULT}"
+    fi
+  fi
+}
+
+prepare_telemt_image() {
+  [[ "${TELEMT_IMAGE_MODE:-official}" == source ]] || return 0
+  validate_source_directory "${TELEMT_SOURCE_DIR:-}" || { warn '源码目录缺失或不完整，未修改部署。'; return 1; }
+  local candidate
+  candidate="navomtp-telemt:source-$(date -u +%Y%m%d%H%M%S)-$(openssl rand -hex 4)" || return 1
+  log "从本地源码构建 Telemt：$TELEMT_SOURCE_DIR"
+  docker build --file "$TELEMT_SOURCE_DIR/Dockerfile.live-tag" --tag "$candidate" "$TELEMT_SOURCE_DIR" || return 1
+  docker image inspect "$candidate" >/dev/null || return 1
+  # A new immutable tag keeps all previous source builds available for rollback.
+  TELEMT_IMAGE="$candidate"
+}
+
+snapshot_deployment_images() {
+  ROLLBACK_TELEMT_REF="$(state_value TELEMT_IMAGE 2>/dev/null || true)"
+  ROLLBACK_NGINX_REF="$(state_value NGINX_IMAGE 2>/dev/null || true)"
+  ROLLBACK_TELEMT_ID="$(docker inspect navomtp-telemt --format '{{.Image}}' 2>/dev/null || true)"
+  ROLLBACK_NGINX_ID="$(docker inspect navomtp-nginx --format '{{.Image}}' 2>/dev/null || true)"
+  if [[ -z "$ROLLBACK_TELEMT_ID" && -n "$ROLLBACK_TELEMT_REF" ]]; then
+    ROLLBACK_TELEMT_ID="$(docker image inspect "$ROLLBACK_TELEMT_REF" --format '{{.Id}}' 2>/dev/null || true)"
+  fi
+  if [[ -z "$ROLLBACK_NGINX_ID" && -n "$ROLLBACK_NGINX_REF" ]]; then
+    ROLLBACK_NGINX_ID="$(docker image inspect "$ROLLBACK_NGINX_REF" --format '{{.Id}}' 2>/dev/null || true)"
+  fi
+}
+
+restore_deployment_images() {
+  if [[ -n "${ROLLBACK_TELEMT_REF:-}" && -n "${ROLLBACK_TELEMT_ID:-}" && "$ROLLBACK_TELEMT_REF" != *@* ]]; then
+    docker tag "$ROLLBACK_TELEMT_ID" "$ROLLBACK_TELEMT_REF" || return 1
+  fi
+  if [[ -n "${ROLLBACK_NGINX_REF:-}" && -n "${ROLLBACK_NGINX_ID:-}" && "$ROLLBACK_NGINX_REF" != *@* ]]; then
+    docker tag "$ROLLBACK_NGINX_ID" "$ROLLBACK_NGINX_REF" || return 1
+  fi
 }
 
 uninstall_navomtp() {
