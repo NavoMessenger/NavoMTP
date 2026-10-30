@@ -9,6 +9,7 @@ TELEMT_IMAGE_DEFAULT="ghcr.io/telemt/telemt:latest"
 NGINX_IMAGE_DEFAULT="nginx:stable-alpine"
 TELEMT_INTERNAL_PORT=9443
 TELEMT_USER_DEFAULT="navo"
+TELEMT_CONFIG_PATH="/etc/telemt/telemt.toml"
 SCRIPT_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 SYSTEMD_DIR="${NAVOMTP_SYSTEMD_DIR:-/etc/systemd/system}"
 
@@ -553,7 +554,7 @@ services:
     container_name: navomtp-telemt
     restart: unless-stopped
     working_dir: /run/telemt
-    command: ["/etc/telemt/config.toml"]
+    command: ["${TELEMT_CONFIG_PATH}"]
     volumes:
       - ./config:/etc/telemt:ro
     tmpfs:
@@ -567,7 +568,7 @@ services:
         soft: 65536
         hard: 262144
     healthcheck:
-      test: ["CMD", "/app/telemt", "healthcheck", "/etc/telemt/config.toml", "--mode", "liveness"]
+      test: ["CMD", "/app/telemt", "healthcheck", "${TELEMT_CONFIG_PATH}", "--mode", "liveness"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -585,6 +586,10 @@ services:
     image: ${NGINX_IMAGE}
     container_name: navomtp-nginx
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 262144
     depends_on:
       telemt:
         condition: service_healthy
@@ -674,8 +679,30 @@ create_staging_tree() {
 telemt_config_check() {
   local config_file="$1"
   timeout 30 docker run --rm --user 0:0 --read-only --network none --tmpfs /run/telemt:rw,mode=1777,size=4m \
-    -w /run/telemt -v "$config_file:/etc/telemt/config.toml:ro" \
-    "$TELEMT_IMAGE" healthcheck /etc/telemt/config.toml --mode liveness
+    -w /run/telemt -v "$config_file:$TELEMT_CONFIG_PATH:ro" \
+    "$TELEMT_IMAGE" healthcheck "$TELEMT_CONFIG_PATH" --mode liveness
+}
+
+verify_telemt_directory_mount() {
+  local staging="$1" probe result=0
+  [[ -f "$staging/config/telemt.toml" ]] || return 1
+  probe="$(mktemp -d "$staging/mount-probe.XXXXXX")" || return 1
+  # Reproduce production ownership and mount layout, without exposing the
+  # candidate's root-only state file or relying on a root validation process.
+  if ! install -d -m 0710 "$probe/config" || ! chown 0:65532 "$probe/config" || \
+    ! install -m 0640 "$staging/config/telemt.toml" "$probe/config/telemt.toml" || \
+    ! chown 0:65532 "$probe/config/telemt.toml"; then
+    rm -rf -- "$probe"; return 1
+  fi
+  timeout 30 docker run --rm --user 65532:65532 --read-only --network none \
+    --tmpfs /run/telemt:rw,mode=1777,size=4m -w /run/telemt \
+    -v "$probe/config:/etc/telemt:ro" "$TELEMT_IMAGE" \
+    healthcheck "$TELEMT_CONFIG_PATH" --mode liveness || result=1
+  rm -rf -- "$probe"
+  if (( result != 0 )); then
+    warn 'Telemt 非 root 目录挂载校验失败，未替换现有部署。'
+    return 1
+  fi
 }
 
 verify_rate_limit_support() {
@@ -730,11 +757,12 @@ verify_images_and_staging() {
     return 1
   fi
   docker compose --project-name "$COMPOSE_PROJECT" -f "$staging/compose.yaml" config --quiet || return 1
-  docker run --rm -v "$staging/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" "$NGINX_IMAGE" nginx -t || return 1
+  docker run --rm --ulimit nofile=65536:262144 -v "$staging/nginx/nginx.conf:/etc/nginx/nginx.conf:ro" "$NGINX_IMAGE" nginx -t || return 1
   if ! telemt_config_check "$staging/config/telemt.toml"; then
     warn "Telemt 配置验证失败；若设置了限速，请通过“更新镜像”升级后重试。"
     return 1
   fi
+  verify_telemt_directory_mount "$staging" || return 1
   verify_rate_limit_support "$staging" || return 1
   verify_ad_tag_support "$staging"
 }
