@@ -34,6 +34,17 @@ Linux architecture (amd64 or arm64):
 docker build -f Dockerfile.live-tag -t navomtp-telemt:live-tag .
 ```
 
+The source-build image defaults to one Cargo build job, disabled LTO, 16 codegen
+units, and optimization level 2. This reduces build memory pressure compared
+with the upstream `fat` LTO/single-codegen-unit release profile, at a possible
+runtime optimization cost. It does not change the repository's Cargo profile.
+Use Docker build arguments `BUILD_JOBS`, `RELEASE_LTO`,
+`RELEASE_CODEGEN_UNITS`, and `RELEASE_OPT_LEVEL` to override these defaults on a
+dedicated builder. A small VPS can still exceed its memory limit. A compiler
+`SIGKILL` alone does not prove OOM: inspect the host kernel OOM logs and any
+container memory limit before attributing the failure. Do not run cargo fix
+merely to address warnings; warnings are not a compiler SIGKILL.
+
 The current NavoMTP wizard also supports managed source builds: upload this
 complete checkout to the proxy server, run `bash navomtp.sh configure`, select
 `source`, and provide its absolute path. The script builds this Dockerfile,
