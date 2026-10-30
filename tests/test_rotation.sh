@@ -103,6 +103,14 @@ test_case() (
       [[ ! -e "$SYSTEMD_DIR/navomtp-rotation.timer" ]] ;;
     mount)
       grep -Fq './config:/etc/telemt:ro' "$INSTALL_DIR/compose.yaml" ;;
+    directory-permissions)
+      chown() { [[ "$1" == 0:65532 ]]; }
+      mkdir "$INSTALL_DIR/permissions"
+      chmod 0700 "$INSTALL_DIR/permissions"
+      prepare_telemt_config_directory "$INSTALL_DIR/permissions" || return 1
+      local directory_mode
+      directory_mode="$(stat -c '%a' "$INSTALL_DIR/permissions" 2>/dev/null || stat -f '%Lp' "$INSTALL_DIR/permissions")"
+      [[ "$directory_mode" == 750 ]] ;;
     configure-sequence|configure-fixed)
       require_supported_host() { return 0; }
       install_base_dependencies() { return 0; }
@@ -130,7 +138,7 @@ test_case() (
   esac
 )
 
-for scenario in pool duplicate malformed singleton zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery multi-due timer mount configure-sequence configure-fixed; do
+for scenario in pool duplicate malformed singleton zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery multi-due timer mount directory-permissions configure-sequence configure-fixed; do
   check "$scenario" test_case "$scenario"
 done
 printf '1..%s\n' "$((pass+fail))"

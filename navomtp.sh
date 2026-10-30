@@ -689,7 +689,7 @@ verify_telemt_directory_mount() {
   probe="$(mktemp -d "$staging/mount-probe.XXXXXX")" || return 1
   # Reproduce production ownership and mount layout, without exposing the
   # candidate's root-only state file or relying on a root validation process.
-  if ! install -d -m 0710 "$probe/config" || ! chown 0:65532 "$probe/config" || \
+  if ! prepare_telemt_config_directory "$probe/config" || \
     ! install -m 0640 "$staging/config/telemt.toml" "$probe/config/telemt.toml" || \
     ! chown 0:65532 "$probe/config/telemt.toml"; then
     rm -rf -- "$probe"; return 1
@@ -703,6 +703,12 @@ verify_telemt_directory_mount() {
     warn 'Telemt 非 root 目录挂载校验失败，未替换现有部署。'
     return 1
   fi
+}
+
+prepare_telemt_config_directory() {
+  # Telemt secure_fs opens parent directories O_RDONLY|O_DIRECTORY, so its
+  # group needs read AND traverse permission. Execute-only (0710) is not enough.
+  install -d -m 0750 "$1" && chown 0:65532 "$1"
 }
 
 verify_rate_limit_support() {
@@ -786,8 +792,7 @@ install_staging() {
   install -m 0644 "$staging/compose.yaml" "$INSTALL_DIR/compose.yaml.new"
   install -m 0600 "$staging/state.env" "$INSTALL_DIR/state.env.new"
   chown 0:65532 "$INSTALL_DIR/config/telemt.toml.new"
-  chown 0:65532 "$INSTALL_DIR/config"
-  chmod 0710 "$INSTALL_DIR/config"
+  prepare_telemt_config_directory "$INSTALL_DIR/config" || return 1
   mv -f "$INSTALL_DIR/config/telemt.toml.new" "$INSTALL_DIR/config/telemt.toml"
   mv -f "$INSTALL_DIR/nginx/nginx.conf.new" "$INSTALL_DIR/nginx/nginx.conf"
   mv -f "$INSTALL_DIR/compose.yaml.new" "$INSTALL_DIR/compose.yaml"
