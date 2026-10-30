@@ -93,6 +93,30 @@ To migrate an older per-group deployment, run `configure`: the former group 1 li
 
 ## Management Commands
 
+### Scheduled tag rotation with an unchanged link
+
+Run `sudo bash navomtp.sh rotation` or select **Configure scheduled tag rotation** in the menu. Select an existing connection group, then choose:
+
+- `fixed`: stop rotation for that group and keep the current tag (use `configure` to change or clear it).
+- `sequence`: cycle through the tag list in order.
+- `random`: randomly select another tag at each interval, avoiding consecutive repeats.
+
+For either rotation mode, enter 2–100 unique, nonzero 32-character hexadecimal tags separated by commas, and an interval of 1–10080 minutes (default 30). Use valid tags obtained through `@MTProxybot`. If the current tag is in the pool, it stays active until the first interval expires; otherwise the first tag becomes active when configuration is deployed. Each group has its own pool and schedule. The proxy secret, public address, ports, and camouflage domain remain unchanged, so existing links continue to work. Overall upload/download limits remain shared.
+
+Initial configuration rebuilds containers to use a read-only directory mount and may briefly interrupt connections. Subsequent scheduled changes use Telemt hot reload and do not deliberately disconnect clients. They apply to new proxy sessions; existing sessions and Telegram's sponsored-channel display are not guaranteed to switch immediately. This is scheduled rotation, not random selection for every new connection.
+
+A root-owned `navomtp-rotation.timer` checks due groups every minute and starts again after reboot. Overdue groups switch once at the next check, without replaying missed intervals. New settings and rotation progress persist in protected `state.env`; an installed copy of the script runs the timer. Disabling rotation for all groups removes the timer, and uninstall removes it too. Configuration and image updates retain the schedules. Changing a group's tag through `configure` disables that group's rotation; leaving its current tag unchanged preserves it.
+
+Every candidate is validated before publication. The worker waits for Telemt's tag-reload log before committing state; failures restore the previous files, and an interrupted transaction is recovered on the next mutation or timer tick. Updates, deployment, uninstall, and timer ticks share a lock. Logs and actual promotion display should still be checked on the target server.
+
+```bash
+sudo bash navomtp.sh rotation      # Configure or stop rotation for one group
+sudo bash navomtp.sh status        # Current tag, mode, interval, next due Unix timestamp
+sudo systemctl status navomtp-rotation.timer
+sudo journalctl -u navomtp-rotation.service -n 50 --no-pager
+sudo bash navomtp.sh rotate        # Check due groups now; does not force an early switch
+```
+
 Run without arguments to open the management menu:
 
 ```bash
@@ -174,6 +198,7 @@ Run local checks without Docker:
 ```bash
 bash -n navomtp.sh
 bash tests/test_navomtp.sh
+bash tests/test_rotation.sh
 shellcheck navomtp.sh tests/test_navomtp.sh
 ```
 

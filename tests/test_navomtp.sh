@@ -95,6 +95,9 @@ assert_equal "limited display" '25 Mbps' "$(rate_limit_label 25)"
 
 tmp_dir="$(mktemp -d /tmp/navomtp-tests.XXXXXX)"
 trap 'rm -rf "$tmp_dir"' EXIT
+export NAVOMTP_SYSTEMD_DIR="$tmp_dir/units"
+SYSTEMD_DIR="$NAVOMTP_SYSTEMD_DIR"
+mkdir -p "$SYSTEMD_DIR"
 PUBLIC_HOST="proxy.example.com"
 PUBLIC_PORTS="12432,22124,32332"
 TELEMT_USER="$TELEMT_USER_DEFAULT"

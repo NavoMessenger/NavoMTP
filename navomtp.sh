@@ -9,6 +9,8 @@ TELEMT_IMAGE_DEFAULT="ghcr.io/telemt/telemt:latest"
 NGINX_IMAGE_DEFAULT="nginx:stable-alpine"
 TELEMT_INTERNAL_PORT=9443
 TELEMT_USER_DEFAULT="navo"
+SCRIPT_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+SYSTEMD_DIR="${NAVOMTP_SYSTEMD_DIR:-/etc/systemd/system}"
 
 log() { printf '[%s] %s\n' "$PROGRAM_NAME" "$*"; }
 warn() { printf '[%s] WARNING: %s\n' "$PROGRAM_NAME" "$*" >&2; }
@@ -35,14 +37,14 @@ require_supported_host() {
 
 install_base_dependencies() {
   local missing=0 command_name
-  for command_name in curl gpg openssl whiptail ss getent timeout; do
+  for command_name in curl gpg openssl whiptail ss getent timeout flock; do
     command -v "$command_name" >/dev/null 2>&1 || missing=1
   done
   (( missing == 0 )) && return 0
   log "安装基础依赖（curl、GPG、OpenSSL、whiptail、DNS/网络工具）..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl gnupg openssl whiptail dnsutils iproute2 coreutils
+  apt-get install -y --no-install-recommends ca-certificates curl gnupg openssl whiptail dnsutils iproute2 coreutils util-linux
 }
 
 configure_docker_repository() {
@@ -150,6 +152,7 @@ load_groups() {
   local count i key
   count="$(state_value GROUP_COUNT 2>/dev/null || true)"
   GROUP_USERS=() GROUP_SECRETS=() GROUP_TAGS=()
+  ROT_MODES=() ROT_POOLS=() ROT_MINUTES=() ROT_NEXT=()
   load_rate_limits || return 1
   if [[ -z "$count" ]]; then
     GROUP_COUNT=1
@@ -170,6 +173,13 @@ load_groups() {
   for ((i=0; i<GROUP_COUNT; i++)); do
     GROUP_SECRETS[i]="$(lowercase "${GROUP_SECRETS[$i]}")"
     GROUP_TAGS[i]="$(lowercase "${GROUP_TAGS[$i]}")"
+    ROT_MODES[i]="$(state_value "GROUP_$((i+1))_ROT_MODE" 2>/dev/null || true)"
+    ROT_MODES[i]="${ROT_MODES[$i]:-fixed}"
+    ROT_POOLS[i]="$(state_value "GROUP_$((i+1))_ROT_POOL" 2>/dev/null || true)"
+    ROT_MINUTES[i]="$(state_value "GROUP_$((i+1))_ROT_MINUTES" 2>/dev/null || true)"
+    ROT_MINUTES[i]="${ROT_MINUTES[$i]:-30}"
+    ROT_NEXT[i]="$(state_value "GROUP_$((i+1))_ROT_NEXT" 2>/dev/null || true)"
+    ROT_NEXT[i]="${ROT_NEXT[$i]:-0}"
   done
 }
 
@@ -184,6 +194,7 @@ validate_groups() {
     secret="$(lowercase "$secret")"
     [[ "$seen_users" != *"|$user|"* && "$seen_secrets" != *"|$secret|"* ]] || return 1
     seen_users+="$user|" seen_secrets+="$secret|"
+    validate_rotation "$i" || return 1
   done
 }
 
@@ -196,6 +207,8 @@ group_summary() {
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
     tag="$(group_value TAG "$i")"
     printf '组 %s | ad_tag：%s\n' "$((i+1))" "${tag:-未设置}"
+    printf '  tag 模式：%s | 间隔：%s 分钟 | 下次执行时间戳：%s\n' \
+      "${ROT_MODES[$i]:-fixed}" "${ROT_MINUTES[$i]:-30}" "${ROT_NEXT[$i]:-0}"
   done
 }
 
@@ -386,7 +399,12 @@ collect_configuration() {
     done
     while :; do
       value="$(dialog_input "组 $((i+1))：广告标签" "填写该组 @MTProxybot 提供的 32 位十六进制 ad_tag；可留空：" "${GROUP_TAGS[$i]:-}")" || return 1
-      if [[ -z "$value" ]] || validate_hex32 "$value"; then GROUP_TAGS[i]="$(lowercase "$value")"; break; fi
+      if [[ -z "$value" ]] || validate_hex32 "$value"; then
+        value="$(lowercase "$value")"
+        if [[ "$value" != "${GROUP_TAGS[$i]:-}" ]]; then ROT_MODES[i]=fixed; ROT_POOLS[i]=''; ROT_NEXT[i]=0; fi
+        GROUP_TAGS[i]="$value"
+        break
+      fi
       dialog_message "输入错误" "ad_tag 必须留空或为 32 位十六进制。"
     done
   done
@@ -537,7 +555,7 @@ services:
     working_dir: /run/telemt
     command: ["/etc/telemt/config.toml"]
     volumes:
-      - ./config/telemt.toml:/etc/telemt/config.toml:ro
+      - ./config:/etc/telemt:ro
     tmpfs:
       - /run/telemt:rw,mode=1777,size=4m
     read_only: true
@@ -636,6 +654,9 @@ EOF
     printf 'GROUP_%s_USER=%s\nGROUP_%s_SECRET=%s\nGROUP_%s_TAG=%s\n' \
       "$((i+1))" "$(group_value USER "$i")" "$((i+1))" "$(group_value SECRET "$i")" \
       "$((i+1))" "$(group_value TAG "$i")" >> "$destination"
+    printf 'GROUP_%s_ROT_MODE=%s\nGROUP_%s_ROT_POOL=%s\nGROUP_%s_ROT_MINUTES=%s\nGROUP_%s_ROT_NEXT=%s\n' \
+      "$((i+1))" "${ROT_MODES[$i]:-fixed}" "$((i+1))" "${ROT_POOLS[$i]:-}" \
+      "$((i+1))" "${ROT_MINUTES[$i]:-30}" "$((i+1))" "${ROT_NEXT[$i]:-0}" >> "$destination"
   done
 }
 
@@ -737,6 +758,8 @@ install_staging() {
   install -m 0644 "$staging/compose.yaml" "$INSTALL_DIR/compose.yaml.new"
   install -m 0600 "$staging/state.env" "$INSTALL_DIR/state.env.new"
   chown 0:65532 "$INSTALL_DIR/config/telemt.toml.new"
+  chown 0:65532 "$INSTALL_DIR/config"
+  chmod 0710 "$INSTALL_DIR/config"
   mv -f "$INSTALL_DIR/config/telemt.toml.new" "$INSTALL_DIR/config/telemt.toml"
   mv -f "$INSTALL_DIR/nginx/nginx.conf.new" "$INSTALL_DIR/nginx/nginx.conf"
   mv -f "$INSTALL_DIR/compose.yaml.new" "$INSTALL_DIR/compose.yaml"
@@ -796,7 +819,7 @@ write_links() {
       warn "未取得组 $((i+1)) 的官方 FakeTLS 链接；请稍后通过「显示连接链接」重试。"
       return 0
     }
-    printf '连接组 %s | ad_tag：%s\n' "$((i+1))" "$(group_value TAG "$i")" >> "$output"
+    printf '连接组 %s\n' "$((i+1))" >> "$output"
   for port in "${PORT_ARRAY[@]}"; do
     tg_link="$(sed -E "s/([?&]port=)[0-9]+/\\1${port}/" <<< "$base_link")"
     query="${tg_link#*\?}"
@@ -847,16 +870,20 @@ deploy_configuration() {
   install_staging "$staging"
 
   log "启动 NavoMTP 服务..."
-  if ! compose up -d --force-recreate --remove-orphans || ! wait_for_healthy; then
+  if ! compose up -d --force-recreate --remove-orphans || ! wait_for_healthy || ! sync_rotation_timer; then
     warn "新配置启动失败。"
     compose logs --no-color --tail 100 >&2 || true
     if (( had_previous == 1 )); then
       warn "正在恢复上一版配置。"
       restore_backup "$backup_dir"
+      load_state
+      sync_rotation_timer || warn '轮换定时器恢复失败，请检查 systemd。'
       compose up -d --force-recreate --remove-orphans || true
       wait_for_healthy || warn "上一版配置也未恢复到健康状态，请立即检查日志。"
     else
       compose down --remove-orphans || true
+      GROUP_COUNT=1 ROT_MODES=(fixed)
+      sync_rotation_timer || warn '清理轮换定时器失败。'
     fi
     rm -rf -- "$staging"
     return 1
@@ -964,6 +991,7 @@ update_images() {
   fi
   record_image_digests
   write_links
+  sync_rotation_timer || return 1
   log "镜像更新完成。"
 }
 
@@ -971,10 +999,197 @@ uninstall_navomtp() {
   require_root
   require_installation
   dialog_yesno "卸载 NavoMTP" "将停止并删除 NavoMTP 容器、专用网络及 $INSTALL_DIR 中的配置和密钥。\n\nDocker 本身和镜像不会被删除。此操作不可撤销，是否继续？" || return 0
+  GROUP_COUNT=1 ROT_MODES=(fixed)
+  sync_rotation_timer || return 1
   compose down --remove-orphans || true
   [[ "$INSTALL_DIR" == /opt/navomtp || "$INSTALL_DIR" == /tmp/navomtp-test-* ]] || die "拒绝删除非预期目录：$INSTALL_DIR"
   rm -rf -- "$INSTALL_DIR"
   log "已删除 NavoMTP 部署；Docker 与容器镜像仍保留。"
+}
+
+normalize_tag_pool() {
+  local raw="$1" tag result='' seen=','
+  local -a tags
+  [[ "$raw" != ,* && "$raw" != *, && "$raw" != *,,* ]] || return 1
+  IFS=, read -r -a tags <<< "$raw"
+  (( ${#tags[@]} >= 2 && ${#tags[@]} <= 100 )) || return 1
+  for tag in "${tags[@]}"; do
+    validate_hex32 "$tag" || return 1
+    tag="$(lowercase "$tag")"
+    [[ "$tag" != 00000000000000000000000000000000 && "$seen" != *",$tag,"* ]] || return 1
+    result+="${result:+,}$tag"; seen+="$tag,"
+  done
+  printf '%s' "$result"
+}
+
+validate_rotation() {
+  local i="$1" mode="${ROT_MODES[$1]:-fixed}" pool minutes next
+  [[ "$mode" == fixed ]] && return 0
+  [[ "$mode" == sequence || "$mode" == random ]] || return 1
+  pool="$(normalize_tag_pool "${ROT_POOLS[$i]:-}")" || return 1
+  [[ ",$pool," == *",$(group_value TAG "$i"),"* ]] || return 1
+  minutes="${ROT_MINUTES[$i]:-}" next="${ROT_NEXT[$i]:-}"
+  [[ "$minutes" =~ ^[1-9][0-9]{0,4}$ ]] && (( minutes <= 10080 )) || return 1
+  [[ "$next" =~ ^[0-9]{1,12}$ ]]
+}
+
+next_rotation_tag() {
+  local mode="$1" current="$2" pool="$3" i index=-1 random_value
+  local -a tags candidates=()
+  IFS=, read -r -a tags <<< "$pool"
+  for ((i=0; i<${#tags[@]}; i++)); do
+    [[ "${tags[$i]}" != "$current" ]] || index="$i"
+    [[ "${tags[$i]}" == "$current" ]] || candidates+=("${tags[$i]}")
+  done
+  if [[ "$mode" == sequence ]]; then
+    printf '%s' "${tags[$(((index+1) % ${#tags[@]}))]}"
+  else
+    # openssl randomness, rather than a time-seeded repeated selection.
+    random_value="$(openssl rand -hex 4)" || return 1
+    printf '%s' "${candidates[$((16#$random_value % ${#candidates[@]}))]}"
+  fi
+}
+
+rotation_enabled() {
+  local i
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    [[ "${ROT_MODES[$i]:-fixed}" == fixed ]] || return 0
+  done
+  return 1
+}
+
+sync_rotation_timer() {
+  local script_target="$INSTALL_DIR/navomtp.sh"
+  if rotation_enabled; then
+    [[ "$INSTALL_DIR" == /opt/navomtp ]] || { warn "自动轮换仅支持标准安装目录 /opt/navomtp。"; return 1; }
+    [[ "$SCRIPT_SOURCE" == "$script_target" ]] || install -m 0700 "$SCRIPT_SOURCE" "$script_target" || return 1
+    cat > "$SYSTEMD_DIR/navomtp-rotation.service" <<'EOF'
+[Unit]
+Description=NavoMTP scheduled ad tag rotation
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/navomtp/navomtp.sh rotate
+TimeoutStartSec=120
+UMask=0077
+EOF
+    cat > "$SYSTEMD_DIR/navomtp-rotation.timer" <<'EOF'
+[Unit]
+Description=Check NavoMTP tag rotation every minute
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=navomtp-rotation.service
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload && systemctl enable --now navomtp-rotation.timer
+  elif [[ -f "$SYSTEMD_DIR/navomtp-rotation.timer" ]]; then
+    systemctl disable --now navomtp-rotation.timer || return 1
+    rm -f -- "$SYSTEMD_DIR/navomtp-rotation.timer" "$SYSTEMD_DIR/navomtp-rotation.service"
+    systemctl daemon-reload
+  fi
+}
+
+configure_rotation() {
+  require_root
+  require_supported_host
+  install_base_dependencies
+  ensure_docker
+  require_installation
+  load_state
+  local value i mode pool minutes current
+  value="$(dialog_input '轮换连接组' "选择组编号（1–${GROUP_COUNT}），组内链接和密钥保持不变：" 1)" || return 0
+  [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( 10#$value >= 1 && 10#$value <= GROUP_COUNT )) || { warn '连接组编号无效。'; return 1; }
+  i=$((10#$value-1))
+  mode="$(dialog_input 'tag 模式' 'fixed：固定（停用轮换）；sequence：定时顺序；random：定时随机，避免连续重复：' "${ROT_MODES[$i]:-fixed}")" || return 0
+  case "$mode" in
+    fixed) ROT_MODES[i]=fixed; ROT_POOLS[i]=''; ROT_NEXT[i]=0 ;;
+    sequence|random)
+      value="$(dialog_input 'tag 列表' '填写 2–100 个不同的有效 tag，用英文逗号分隔，不含空格；不能使用全零 tag：' "${ROT_POOLS[$i]:-}")" || return 0
+      pool="$(normalize_tag_pool "$value")" || { warn 'tag 列表无效或有重复。'; return 1; }
+      minutes="$(dialog_input '轮换间隔' '间隔分钟数（1–10080）；约每分钟检查到期组。新会话生效，已有连接不强制断开：' "${ROT_MINUTES[$i]:-30}")" || return 0
+      [[ "$minutes" =~ ^[1-9][0-9]{0,4}$ ]] && (( minutes <= 10080 )) || { warn '间隔无效。'; return 1; }
+      current="${GROUP_TAGS[$i]}"
+      [[ ",$pool," == *",$current,"* ]] || current="${pool%%,*}"
+      GROUP_TAGS[i]="$current" ROT_MODES[i]="$mode" ROT_POOLS[i]="$pool" ROT_MINUTES[i]="$minutes" ROT_NEXT[i]="$(( $(date +%s) + minutes*60 ))"
+      ;;
+    *) warn '模式无效。'; return 1 ;;
+  esac
+  sync_first_group
+  validate_groups || return 1
+  dialog_yesno '确认轮换设置' "$(group_summary)\n首次启用会重建容器以升级配置挂载，可能短暂断线。之后自动轮换通过热重载生效。已有会话不保证立即改变推广显示。" || return 0
+  deploy_configuration
+}
+
+publish_rotation_config() {
+  install -m 0640 "$1" "$INSTALL_DIR/config/.telemt.next" && \
+    chown 0:65532 "$INSTALL_DIR/config/.telemt.next" && \
+    mv -f "$INSTALL_DIR/config/.telemt.next" "$INSTALL_DIR/config/telemt.toml"
+}
+
+reload_rotation_config() {
+  docker kill --signal HUP navomtp-telemt >/dev/null
+}
+
+wait_rotation_reload() {
+  local since="$1" deadline=$((SECONDS+20))
+  while (( SECONDS < deadline )); do
+    if docker logs --since "$since" navomtp-telemt 2>&1 | grep -q 'config reload: user_ad_tags updated'; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+recover_rotation() {
+  local journal="$INSTALL_DIR/.rotation-transaction"
+  [[ -d "$journal" ]] || return 0
+  publish_rotation_config "$journal/telemt.toml" || return 1
+  install -m 0600 "$journal/state.env" "$INSTALL_DIR/state.env.next" && mv -f "$INSTALL_DIR/state.env.next" "$INSTALL_DIR/state.env" || return 1
+  reload_rotation_config || return 1
+  rm -rf -- "$journal"
+  warn '已恢复轮换前配置；后续任务会重新尝试。'
+}
+
+rotate_tags() {
+  require_root
+  require_installation
+  recover_rotation || return 1
+  load_state
+  local now i changed=0 staging journal="$INSTALL_DIR/.rotation-transaction" since
+  now="$(date +%s)"
+  for ((i=0; i<GROUP_COUNT; i++)); do
+    [[ "${ROT_MODES[$i]:-fixed}" != fixed ]] || continue
+    (( now >= ${ROT_NEXT[$i]} )) || continue
+    GROUP_TAGS[i]="$(next_rotation_tag "${ROT_MODES[$i]}" "${GROUP_TAGS[$i]}" "${ROT_POOLS[$i]}")" || return 1
+    ROT_NEXT[i]="$((now + ${ROT_MINUTES[$i]}*60))"
+    changed=1
+  done
+  (( changed == 1 )) || return 0
+  sync_first_group
+  staging="$(mktemp -d "$INSTALL_DIR/.rotate.XXXXXX")" || return 1
+  if ! render_telemt_config "$staging/telemt.toml" || ! telemt_config_check "$staging/telemt.toml"; then
+    rm -rf -- "$staging"; warn '轮换候选配置校验失败，保留原配置。'; return 1
+  fi
+  render_state "$staging/state.env"
+  if ! install -d -m 0700 "$staging/journal" || \
+    ! cp -p "$INSTALL_DIR/config/telemt.toml" "$staging/journal/telemt.toml" || \
+    ! cp -p "$INSTALL_DIR/state.env" "$staging/journal/state.env" || \
+    ! mv "$staging/journal" "$journal"; then
+    rm -rf -- "$staging"; return 1
+  fi
+  since="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+  if ! publish_rotation_config "$staging/telemt.toml" || ! reload_rotation_config || ! wait_rotation_reload "$since"; then
+    recover_rotation || warn '恢复失败，请检查 Docker 和服务日志。'
+    rm -rf -- "$staging"; warn '轮换未确认生效，已请求恢复原配置。'; return 1
+  fi
+  if ! install -m 0600 "$staging/state.env" "$INSTALL_DIR/state.env.next" || ! mv -f "$INSTALL_DIR/state.env.next" "$INSTALL_DIR/state.env"; then
+    recover_rotation || true; rm -rf -- "$staging"; return 1
+  fi
+  rm -rf -- "$journal" "$staging"
+  log '到期连接组 tag 已热重载；代理链接和整体限速保持不变。'
 }
 
 show_help() {
@@ -990,6 +1205,8 @@ ${PROGRAM_NAME} ${PROGRAM_VERSION}
   logs         持续查看最近日志
   update       拉取并切换新镜像
   links        显示 Telegram 连接链接
+  rotation     配置某组固定 / 顺序 / 随机 tag 轮换
+  rotate       后台检查并轮换到期组（不提前轮换）
   uninstall    卸载本项目（不卸载 Docker）
   help         显示帮助
 
@@ -1010,28 +1227,44 @@ main_menu() {
       "4" "更新容器镜像" \
       "5" "显示连接链接" \
       "6" "卸载 NavoMTP" \
+      "7" "配置 tag 定时轮换" \
       "0" "退出" 3>&1 1>&2 2>&3) || break
     case "$choice" in
-      1) install_or_configure ;;
+      1) run_locked install_or_configure ;;
       2) show_status; read -r -p "按 Enter 返回菜单..." _ ;;
       3) show_logs || true ;;
-      4) update_images ;;
+      4) run_locked update_images ;;
       5) show_links ;;
-      6) uninstall_navomtp; [[ -d "$INSTALL_DIR" ]] || break ;;
+      6) run_locked uninstall_navomtp; [[ -d "$INSTALL_DIR" ]] || break ;;
+      7) run_locked configure_rotation ;;
       0) break ;;
     esac
   done
 }
 
+run_locked() (
+      require_root
+      command -v flock >/dev/null 2>&1 || die '需要 flock（util-linux），请先安装。'
+      exec 9>/run/lock/navomtp.lock
+      if ! flock -n 9; then
+        if [[ "$1" == rotate_tags ]]; then return 0; fi
+        die '另一项 NavoMTP 操作正在进行，请稍后重试。'
+      fi
+      if [[ -d "$INSTALL_DIR/.rotation-transaction" ]]; then recover_rotation || die '未能恢复未完成的轮换事务。'; fi
+      "$@"
+)
+
 main() {
   case "${1:-menu}" in
     menu) main_menu ;;
-    install|configure) install_or_configure ;;
+    install|configure) run_locked install_or_configure ;;
+    rotation) run_locked configure_rotation ;;
+    rotate) run_locked rotate_tags ;;
     status) show_status ;;
     logs) show_logs ;;
-    update) update_images ;;
+    update) run_locked update_images ;;
     links) show_links false ;;
-    uninstall) uninstall_navomtp ;;
+    uninstall) run_locked uninstall_navomtp ;;
     help|-h|--help) show_help ;;
     *) show_help >&2; exit 2 ;;
   esac

@@ -93,6 +93,30 @@ sudo bash navomtp.sh install
 
 ## 管理命令
 
+### 同一链接定时轮换 tag
+
+运行 `sudo bash navomtp.sh rotation`，或在菜单中选择“配置 tag 定时轮换”，选择已有连接组后设置模式：
+
+- `fixed`：停止该组轮换，保留当前 tag；需要更换或清空时使用 `configure`。
+- `sequence`：按 tag 列表依次循环。
+- `random`：每个周期随机选另一个 tag，避免连续重复。
+
+轮换模式需要填写 2–100 个不同的、非全零的 32 位十六进制 tag，用英文逗号分隔；间隔为 1–10080 分钟，默认 30 分钟。请使用通过 `@MTProxybot` 取得的有效 tag。若当前 tag 在列表内，保持到首个周期到期；否则配置部署时先启用列表第一个 tag。每组独立设置列表与周期，密钥、公网地址、端口和伪装域名保持不变，原有链接继续使用，整体上下行限速也不变。
+
+首次设置会重建容器以升级为只读目录挂载，可能短暂断线。之后后台通过 Telemt 热重载切换，不主动断开客户端。切换影响新建代理会话，已有连接及 Telegram 推广频道显示不保证立即变化；这不是“每个新连接随机分配”。
+
+`navomtp-rotation.timer` 由 root 管理，每分钟检查到期组，服务器重启后自动恢复；错过多个周期时只在下次检查补切换一次，不补放全部历史周期。设置和进度保存在受保护的 `state.env`，后台使用部署目录中的脚本副本。所有组关闭轮换或卸载时会移除定时器。配置及镜像更新保留轮换设置；在 `configure` 中更改某组 tag 会关闭该组轮换，保持当前 tag 不变则保留轮换。
+
+每次切换先验证候选配置，等待 Telemt 的 tag 热重载日志后再提交状态；失败恢复原文件，中断事务在下次修改操作或定时任务中恢复。安装、配置、更新、卸载和轮换共用操作锁。实际推广显示仍需在目标服务器和 Telegram 客户端检查。
+
+```bash
+sudo bash navomtp.sh rotation      # 配置或停止某组轮换
+sudo bash navomtp.sh status        # 当前 tag、模式、间隔、下次执行 Unix 时间戳
+sudo systemctl status navomtp-rotation.timer
+sudo journalctl -u navomtp-rotation.service -n 50 --no-pager
+sudo bash navomtp.sh rotate        # 立即检查到期组，不提前强制切换
+```
+
 不带参数运行会打开管理菜单：
 
 ```bash
@@ -174,6 +198,7 @@ sudo bash navomtp.sh uninstall   # 删除本项目，不卸载 Docker
 ```bash
 bash -n navomtp.sh
 bash tests/test_navomtp.sh
+bash tests/test_rotation.sh
 shellcheck navomtp.sh tests/test_navomtp.sh
 ```
 
