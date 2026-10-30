@@ -1,0 +1,311 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use crate::config::{GeneralConfig, MeRouteNoWriterMode, MeSocksKdfPolicy, MeWriterPickMode};
+use crate::crypto::SecureRandom;
+use crate::network::IpFamily;
+use crate::network::probe::NetworkDecision;
+use crate::stats::Stats;
+
+use super::pool::{MePool, ReinitStatusSnapshot, WriterContour, WriterRole};
+use super::pool_writer_security_tests::make_pool_with_decision;
+
+async fn make_pool() -> Arc<MePool> {
+    let general = GeneralConfig::default();
+
+    MePool::new(
+        None,
+        vec![1u8; 32],
+        None,
+        false,
+        None,
+        Vec::new(),
+        false,
+        Vec::new(),
+        1,
+        None,
+        12,
+        1200,
+        HashMap::new(),
+        HashMap::new(),
+        None,
+        NetworkDecision {
+            ipv4_me: true,
+            ..NetworkDecision::default()
+        },
+        None,
+        Arc::new(SecureRandom::new()),
+        Arc::new(Stats::default()),
+        general.me_keepalive_enabled,
+        general.me_keepalive_interval_secs,
+        general.me_keepalive_jitter_secs,
+        general.me_keepalive_payload_random,
+        general.rpc_proxy_req_every,
+        general.me_warmup_stagger_enabled,
+        general.me_warmup_step_delay_ms,
+        general.me_warmup_step_jitter_ms,
+        general.me_reconnect_max_concurrent_per_dc,
+        general.me_reconnect_backoff_base_ms,
+        general.me_reconnect_backoff_cap_ms,
+        general.me_reconnect_fast_retry_count,
+        general.me_single_endpoint_shadow_writers,
+        general.me_single_endpoint_outage_mode_enabled,
+        general.me_single_endpoint_outage_disable_quarantine,
+        general.me_single_endpoint_outage_backoff_min_ms,
+        general.me_single_endpoint_outage_backoff_max_ms,
+        general.me_single_endpoint_shadow_rotate_every_secs,
+        general.me_floor_mode,
+        general.me_adaptive_floor_idle_secs,
+        general.me_adaptive_floor_min_writers_single_endpoint,
+        general.me_adaptive_floor_min_writers_multi_endpoint,
+        general.me_adaptive_floor_recover_grace_secs,
+        general.me_adaptive_floor_writers_per_core_total,
+        general.me_adaptive_floor_cpu_cores_override,
+        general.me_adaptive_floor_max_extra_writers_single_per_core,
+        general.me_adaptive_floor_max_extra_writers_multi_per_core,
+        general.me_adaptive_floor_max_active_writers_per_core,
+        general.me_adaptive_floor_max_warm_writers_per_core,
+        general.me_adaptive_floor_max_active_writers_global,
+        general.me_adaptive_floor_max_warm_writers_global,
+        general.hardswap,
+        general.me_pool_drain_ttl_secs,
+        general.me_instadrain,
+        general.me_pool_drain_threshold,
+        general.me_pool_drain_soft_evict_enabled,
+        general.me_pool_drain_soft_evict_grace_secs,
+        general.me_pool_drain_soft_evict_per_writer,
+        general.me_pool_drain_soft_evict_budget_per_core,
+        general.me_pool_drain_soft_evict_cooldown_ms,
+        general.effective_me_pool_force_close_secs(),
+        general.me_pool_min_fresh_ratio,
+        general.me_hardswap_warmup_delay_min_ms,
+        general.me_hardswap_warmup_delay_max_ms,
+        general.me_hardswap_warmup_extra_passes,
+        general.me_hardswap_warmup_pass_backoff_base_ms,
+        general.me_bind_stale_mode,
+        general.me_bind_stale_ttl_secs,
+        general.me_secret_atomic_snapshot,
+        general.me_deterministic_writer_sort,
+        MeWriterPickMode::default(),
+        general.me_writer_pick_sample_size,
+        MeSocksKdfPolicy::default(),
+        general.me_writer_cmd_channel_capacity,
+        general.me_writer_byte_budget_bytes,
+        general.me_route_channel_capacity,
+        general.me_route_backpressure_enabled,
+        general.me_route_fairshare_enabled,
+        general.me_route_backpressure_base_timeout_ms,
+        general.me_route_backpressure_high_timeout_ms,
+        general.me_route_backpressure_high_watermark_pct,
+        general.me_reader_route_data_wait_ms,
+        general.me_health_interval_ms_unhealthy,
+        general.me_health_interval_ms_healthy,
+        general.me_warn_rate_limit_ms,
+        MeRouteNoWriterMode::default(),
+        general.me_route_no_writer_wait_ms,
+        general.me_route_hybrid_max_wait_ms,
+        general.me_route_blocking_send_timeout_ms,
+        general.me_route_inline_recovery_attempts,
+        general.me_route_inline_recovery_wait_ms,
+        16_384,
+    )
+}
+
+#[tokio::test]
+async fn connectable_endpoints_waits_until_quarantine_expires() {
+    let pool = make_pool().await;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 11)), 443);
+
+    {
+        let mut guard = pool.endpoint_quarantine.lock().await;
+        guard.insert(addr, Instant::now() + Duration::from_millis(500));
+    }
+
+    let endpoints = tokio::time::timeout(
+        Duration::from_millis(120),
+        pool.connectable_endpoints_for_test(&[addr]),
+    )
+    .await
+    .expect("single-endpoint outage mode should bypass quarantine delay");
+    assert_eq!(endpoints, vec![addr]);
+}
+
+#[tokio::test]
+async fn connectable_endpoints_releases_quarantine_lock_before_sleep() {
+    let pool = make_pool().await;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 12)), 443);
+
+    {
+        let mut guard = pool.endpoint_quarantine.lock().await;
+        guard.insert(addr, Instant::now() + Duration::from_millis(120));
+    }
+
+    let pool_for_task = Arc::clone(&pool);
+    let task =
+        tokio::spawn(async move { pool_for_task.connectable_endpoints_for_test(&[addr]).await });
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let quarantine_check = tokio::time::timeout(
+        Duration::from_millis(40),
+        pool.is_endpoint_quarantined(addr),
+    )
+    .await;
+    assert!(
+        quarantine_check.is_ok(),
+        "quarantine lock must not be held while waiting for expiry"
+    );
+    assert!(quarantine_check.expect("timeout"));
+
+    let endpoints = tokio::time::timeout(Duration::from_millis(300), task)
+        .await
+        .expect("connectable_endpoints task timed out")
+        .expect("task join failed");
+    assert_eq!(endpoints, vec![addr]);
+}
+
+#[tokio::test]
+async fn refill_does_not_queue_a_removed_dc_target() {
+    let pool = make_pool().await;
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 20)), 443);
+
+    pool.trigger_immediate_refill_for_dc(addr, 2);
+
+    assert!(pool.refill_states.lock().is_empty());
+    assert_eq!(pool.refill_running.load(Ordering::Acquire), 0);
+    assert_eq!(pool.refill_pending.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refill_accepts_enabled_nonpreferred_family_without_multipath() {
+    let pool = make_pool_with_decision(NetworkDecision {
+        ipv4_me: true,
+        ipv6_me: true,
+        effective_prefer: 4,
+        effective_multipath: false,
+        ..NetworkDecision::default()
+    })
+    .await;
+    let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+    let v6_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+    pool.update_proxy_maps(
+        HashMap::from([(2, vec![(v4_addr.ip(), v4_addr.port())])]),
+        Some(HashMap::from([(2, vec![(v6_addr.ip(), v6_addr.port())])])),
+    )
+    .await;
+
+    pool.trigger_immediate_refill_for_dc(v6_addr, 2);
+
+    assert_eq!(pool.refill_states.lock().len(), 1);
+    assert_eq!(pool.refill_running.load(Ordering::Acquire), 1);
+    pool.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pool.refill_running.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(pool.refill_states.lock().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stale_endpoint_revision_cancels_queued_warm_refill_before_connect() {
+    let pool = make_pool().await;
+    let old_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 30)), 443);
+    let new_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 31)), 443);
+    pool.update_proxy_maps(
+        HashMap::from([(2, vec![(old_addr.ip(), old_addr.port())])]),
+        None,
+    )
+    .await;
+    let old_revision = pool.endpoint_snapshot.load().revision;
+    let pending_generation = pool.current_generation().saturating_add(1);
+    pool.reinit.status.store(Arc::new(ReinitStatusSnapshot {
+        active_generation: pool.current_generation(),
+        warm_generations: vec![pending_generation],
+        pending_hardswap_generation: pending_generation,
+        pending_hardswap_started_at_epoch_secs: 1,
+        pending_hardswap_map_hash: 1,
+        pending_hardswap_endpoint_revision: old_revision,
+        inflight: 1,
+    }));
+    pool.trigger_immediate_refill_for_role(
+        old_addr,
+        WriterRole {
+            dc: 2,
+            family: IpFamily::V4,
+            generation: pending_generation,
+            contour: WriterContour::Warm,
+        },
+    );
+    assert_eq!(pool.refill_states.lock().len(), 1);
+
+    pool.update_proxy_maps(
+        HashMap::from([(2, vec![(new_addr.ip(), new_addr.port())])]),
+        None,
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pool.refill_running.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(pool.refill_states.lock().is_empty());
+    assert_eq!(pool.stats.get_me_reconnect_attempts(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refill_preserves_bounded_pending_cardinality_and_cleans_up_before_first_poll() {
+    let pool = make_pool().await;
+    let first = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 21)), 443);
+    let second = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 22)), 443);
+    let latest = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 31, 0, 23)), 443);
+    pool.update_proxy_maps(
+        HashMap::from([(
+            2,
+            vec![
+                (first.ip(), first.port()),
+                (second.ip(), second.port()),
+                (latest.ip(), latest.port()),
+            ],
+        )]),
+        None,
+    )
+    .await;
+
+    pool.trigger_immediate_refill_for_dc(first, 2);
+    pool.trigger_immediate_refill_for_dc(second, 2);
+    pool.trigger_immediate_refill_for_dc(latest, 2);
+
+    assert_eq!(pool.refill_states.lock().len(), 1);
+    assert_eq!(pool.refill_running.load(Ordering::Acquire), 1);
+    assert_eq!(pool.refill_pending.load(Ordering::Acquire), 2);
+    let state = pool
+        .refill_states
+        .lock()
+        .values()
+        .copied()
+        .next()
+        .expect("refill state");
+    assert_eq!(state.pending_count, 2);
+    assert_eq!(state.next_addr, Some(latest));
+
+    pool.begin_shutdown();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while pool.refill_running.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(pool.refill_states.lock().is_empty());
+    assert_eq!(pool.refill_pending.load(Ordering::Acquire), 0);
+}

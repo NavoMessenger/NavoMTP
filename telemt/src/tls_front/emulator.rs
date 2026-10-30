@@ -1,0 +1,1046 @@
+#![allow(clippy::too_many_arguments)]
+
+use crate::crypto::{SecureRandom, sha256_hmac};
+use crate::protocol::constants::{
+    MAX_TLS_CIPHERTEXT_SIZE, TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER,
+    TLS_RECORD_HANDSHAKE, TLS_VERSION,
+};
+use crate::protocol::tls::{
+    ClientHelloTlsVersion, ServerHelloKeyShare, TLS_DIGEST_LEN, TLS_DIGEST_POS,
+    TLS_NAMED_GROUP_X25519, TLS_NAMED_GROUP_X25519MLKEM768,
+};
+use crate::tls_front::types::{
+    CachedTlsData, ParsedCertificateInfo, TlsExtension, TlsProfileSource,
+};
+use crc32fast::Hasher;
+
+const MIN_APP_DATA: usize = 64;
+const MAX_APP_DATA: usize = MAX_TLS_CIPHERTEXT_SIZE;
+const MAX_TICKET_RECORDS: usize = 4;
+const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
+const EXT_KEY_SHARE: u16 = 0x0033;
+const EXT_ALPN: u16 = 0x0010;
+
+#[derive(Clone, Copy)]
+enum FallbackShapeFamily {
+    NginxLike,
+    BoringSslLike,
+    RustlsLike,
+}
+
+fn parse_profiled_key_share_group(data: &[u8]) -> Option<u16> {
+    if data.len() < 4 {
+        return None;
+    }
+
+    let group = u16::from_be_bytes([data[0], data[1]]);
+    let key_exchange_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    if data.len() != 4 + key_exchange_len {
+        return None;
+    }
+
+    match group {
+        TLS_NAMED_GROUP_X25519 | TLS_NAMED_GROUP_X25519MLKEM768 => Some(group),
+        _ => None,
+    }
+}
+
+fn effective_profiled_server_hello_record_len(cached: &CachedTlsData) -> usize {
+    if cached.behavior_profile.server_hello_record_len == 0 {
+        cached.server_hello_template.record_body_len()
+    } else {
+        cached.behavior_profile.server_hello_record_len
+    }
+}
+
+fn should_replay_profiled_server_hello_shape(cached: &CachedTlsData) -> bool {
+    matches!(
+        cached.behavior_profile.source,
+        TlsProfileSource::Raw | TlsProfileSource::Merged
+    ) && cached
+        .server_hello_template
+        .is_replay_safe_tls13_shape(effective_profiled_server_hello_record_len(cached))
+}
+
+/// Return the origin-profiled ServerHello key_share group when it is replay-safe.
+pub(crate) fn profiled_server_hello_key_share_group(cached: &CachedTlsData) -> Option<u16> {
+    if !should_replay_profiled_server_hello_shape(cached) {
+        return None;
+    }
+
+    cached
+        .server_hello_template
+        .extensions
+        .iter()
+        .find(|ext| ext.ext_type == EXT_KEY_SHARE)
+        .and_then(|ext| parse_profiled_key_share_group(&ext.data))
+}
+
+fn jitter_and_clamp_sizes(sizes: &[usize], rng: &SecureRandom) -> Vec<usize> {
+    sizes
+        .iter()
+        .map(|&size| {
+            let base = size.clamp(MIN_APP_DATA, MAX_APP_DATA);
+            let jitter_range = ((base as f64) * 0.03).round() as i64;
+            if jitter_range == 0 {
+                return base;
+            }
+            let mut rand_bytes = [0u8; 2];
+            rand_bytes.copy_from_slice(&rng.bytes(2));
+            let span = 2 * jitter_range + 1;
+            let delta = (u16::from_le_bytes(rand_bytes) as i64 % span) - jitter_range;
+            let adjusted = (base as i64 + delta).clamp(MIN_APP_DATA as i64, MAX_APP_DATA as i64);
+            adjusted as usize
+        })
+        .collect()
+}
+
+fn app_data_body_capacity(sizes: &[usize]) -> usize {
+    sizes.iter().map(|&size| size.saturating_sub(17)).sum()
+}
+
+fn ensure_payload_capacity(mut sizes: Vec<usize>, payload_len: usize) -> Vec<usize> {
+    if payload_len == 0 {
+        return sizes;
+    }
+
+    let mut body_total = app_data_body_capacity(&sizes);
+    if body_total >= payload_len {
+        return sizes;
+    }
+
+    if let Some(last) = sizes.last_mut() {
+        let free = MAX_APP_DATA.saturating_sub(*last);
+        let grow = free.min(payload_len - body_total);
+        *last += grow;
+        body_total += grow;
+    }
+
+    while body_total < payload_len {
+        let remaining = payload_len - body_total;
+        let chunk = (remaining + 17).clamp(MIN_APP_DATA, MAX_APP_DATA);
+        sizes.push(chunk);
+        body_total += chunk.saturating_sub(17);
+    }
+
+    sizes
+}
+
+fn fallback_shape_family(cached: &CachedTlsData) -> FallbackShapeFamily {
+    match cached.behavior_profile.source {
+        TlsProfileSource::Rustls => FallbackShapeFamily::RustlsLike,
+        TlsProfileSource::Default => {
+            let mut hasher = Hasher::new();
+            hasher.update(cached.domain.as_bytes());
+            hasher.update(&cached.total_app_data_len.to_le_bytes());
+            if hasher.finalize() & 1 == 0 {
+                FallbackShapeFamily::NginxLike
+            } else {
+                FallbackShapeFamily::BoringSslLike
+            }
+        }
+        TlsProfileSource::Raw | TlsProfileSource::Merged => FallbackShapeFamily::NginxLike,
+    }
+}
+
+fn fallback_total_app_data_len(cached: &CachedTlsData) -> usize {
+    cached
+        .total_app_data_len
+        .max(cached.app_data_records_sizes.iter().sum())
+        .max(1024)
+}
+
+fn push_fallback_size(sizes: &mut Vec<usize>, size: usize) {
+    sizes.push(size.clamp(MIN_APP_DATA, MAX_APP_DATA));
+}
+
+fn fallback_family_app_data_sizes(cached: &CachedTlsData) -> Vec<usize> {
+    let mut sizes = Vec::with_capacity(1);
+    let size = if matches!(cached.behavior_profile.source, TlsProfileSource::Rustls) {
+        cached
+            .app_data_records_sizes
+            .first()
+            .copied()
+            .unwrap_or_else(|| fallback_total_app_data_len(cached))
+    } else {
+        fallback_total_app_data_len(cached)
+    };
+    push_fallback_size(&mut sizes, size);
+    sizes
+}
+
+fn emulated_app_data_sizes(cached: &CachedTlsData) -> Vec<usize> {
+    match cached.behavior_profile.source {
+        TlsProfileSource::Raw | TlsProfileSource::Merged => {
+            if let Some(size) = cached.behavior_profile.app_data_record_sizes.first() {
+                return vec![(*size).clamp(MIN_APP_DATA, MAX_APP_DATA)];
+            }
+            if let Some(size) = cached.app_data_records_sizes.first() {
+                return vec![(*size).clamp(MIN_APP_DATA, MAX_APP_DATA)];
+            }
+            return vec![
+                cached
+                    .total_app_data_len
+                    .max(1024)
+                    .clamp(MIN_APP_DATA, MAX_APP_DATA),
+            ];
+        }
+        TlsProfileSource::Default | TlsProfileSource::Rustls => {
+            return fallback_family_app_data_sizes(cached);
+        }
+    }
+}
+
+fn emulated_change_cipher_spec_count(_cached: &CachedTlsData) -> usize {
+    1
+}
+
+fn emulated_ticket_record_sizes(
+    cached: &CachedTlsData,
+    new_session_tickets: u8,
+    rng: &SecureRandom,
+) -> Vec<usize> {
+    let target_count = usize::from(new_session_tickets.min(MAX_TICKET_RECORDS as u8));
+    if target_count == 0 {
+        return Vec::new();
+    }
+
+    let profiled_sizes = match cached.behavior_profile.source {
+        TlsProfileSource::Raw | TlsProfileSource::Merged => {
+            cached.behavior_profile.ticket_record_sizes.as_slice()
+        }
+        TlsProfileSource::Default | TlsProfileSource::Rustls => &[],
+    };
+
+    let mut sizes = Vec::with_capacity(target_count);
+    sizes.extend(profiled_sizes.iter().copied().take(target_count));
+
+    while sizes.len() < target_count {
+        let family = fallback_shape_family(cached);
+        let base = match family {
+            FallbackShapeFamily::NginxLike => 96,
+            FallbackShapeFamily::BoringSslLike => 80,
+            FallbackShapeFamily::RustlsLike => 112,
+        };
+        sizes.push(base + rng.range(64));
+    }
+
+    sizes
+}
+
+fn build_compact_cert_info_payload(cert_info: &ParsedCertificateInfo) -> Option<Vec<u8>> {
+    let mut fields = Vec::new();
+
+    if let Some(subject) = cert_info.subject_cn.as_deref() {
+        fields.push(format!("CN={subject}"));
+    }
+    if let Some(issuer) = cert_info.issuer_cn.as_deref() {
+        fields.push(format!("ISSUER={issuer}"));
+    }
+    if let Some(not_before) = cert_info.not_before_unix {
+        fields.push(format!("NB={not_before}"));
+    }
+    if let Some(not_after) = cert_info.not_after_unix {
+        fields.push(format!("NA={not_after}"));
+    }
+    if !cert_info.san_names.is_empty() {
+        let san = cert_info
+            .san_names
+            .iter()
+            .take(8)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!("SAN={san}"));
+    }
+
+    if fields.is_empty() {
+        return None;
+    }
+
+    let mut payload = fields.join(";").into_bytes();
+    if payload.len() > 512 {
+        payload.truncate(512);
+    }
+    Some(payload)
+}
+
+fn hash_compact_cert_info_payload(cert_payload: Vec<u8>) -> Option<Vec<u8>> {
+    if cert_payload.is_empty() {
+        return None;
+    }
+
+    let mut hashed = Vec::with_capacity(cert_payload.len());
+    let mut seed_hasher = Hasher::new();
+    seed_hasher.update(&cert_payload);
+    let mut state = seed_hasher.finalize();
+
+    while hashed.len() < cert_payload.len() {
+        let mut hasher = Hasher::new();
+        hasher.update(&state.to_le_bytes());
+        hasher.update(&cert_payload);
+        state = hasher.finalize();
+
+        let block = state.to_le_bytes();
+        let remaining = cert_payload.len() - hashed.len();
+        let copy_len = remaining.min(block.len());
+        hashed.extend_from_slice(&block[..copy_len]);
+    }
+
+    Some(hashed)
+}
+
+fn push_supported_versions_extension(extensions: &mut Vec<u8>) {
+    extensions.extend_from_slice(&EXT_SUPPORTED_VERSIONS.to_be_bytes());
+    extensions.extend_from_slice(&(2u16).to_be_bytes());
+    extensions.extend_from_slice(&0x0304u16.to_be_bytes());
+}
+
+fn push_key_share_entry(extensions: &mut Vec<u8>, group: u16, key_exchange: &[u8]) {
+    let Ok(key_exchange_len) = u16::try_from(key_exchange.len()) else {
+        return;
+    };
+    let Some(entry_len) = key_exchange.len().checked_add(4) else {
+        return;
+    };
+    let Ok(entry_len) = u16::try_from(entry_len) else {
+        return;
+    };
+
+    extensions.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+    extensions.extend_from_slice(&entry_len.to_be_bytes());
+    extensions.extend_from_slice(&group.to_be_bytes());
+    extensions.extend_from_slice(&key_exchange_len.to_be_bytes());
+    extensions.extend_from_slice(key_exchange);
+}
+
+fn push_key_share_extension(extensions: &mut Vec<u8>, server_key_share: &ServerHelloKeyShare) {
+    push_key_share_entry(
+        extensions,
+        server_key_share.group(),
+        server_key_share.key_exchange(),
+    );
+}
+
+fn replay_profiled_server_hello_extension(
+    ext: &TlsExtension,
+    extensions: &mut Vec<u8>,
+    server_key_share: &ServerHelloKeyShare,
+    saw_supported_versions: &mut bool,
+    saw_key_share: &mut bool,
+) {
+    match ext.ext_type {
+        EXT_SUPPORTED_VERSIONS if !*saw_supported_versions => {
+            push_supported_versions_extension(extensions);
+            *saw_supported_versions = true;
+        }
+        EXT_KEY_SHARE if !*saw_key_share => {
+            push_key_share_extension(extensions, server_key_share);
+            *saw_key_share = true;
+        }
+        EXT_ALPN => {}
+        _ => {}
+    }
+}
+
+fn build_profiled_server_hello_extensions(
+    cached: &CachedTlsData,
+    server_key_share: &ServerHelloKeyShare,
+) -> Vec<u8> {
+    let capacity = cached
+        .server_hello_template
+        .extensions
+        .iter()
+        .map(|ext| 4 + ext.data.len())
+        .sum::<usize>()
+        .max(44);
+    let mut extensions = Vec::with_capacity(capacity);
+    let mut saw_supported_versions = false;
+    let mut saw_key_share = false;
+
+    if should_replay_profiled_server_hello_shape(cached) {
+        for ext in &cached.server_hello_template.extensions {
+            replay_profiled_server_hello_extension(
+                ext,
+                &mut extensions,
+                server_key_share,
+                &mut saw_supported_versions,
+                &mut saw_key_share,
+            );
+        }
+    }
+
+    if !saw_supported_versions {
+        push_supported_versions_extension(&mut extensions);
+    }
+    if !saw_key_share {
+        push_key_share_extension(&mut extensions, server_key_share);
+    }
+
+    extensions
+}
+
+/// Build a ServerHello + CCS + ApplicationData sequence using cached TLS metadata.
+pub fn build_emulated_server_hello(
+    secret: &[u8],
+    client_digest: &[u8; TLS_DIGEST_LEN],
+    session_id: &[u8],
+    cached: &CachedTlsData,
+    use_full_cert_payload: bool,
+    serverhello_compact: bool,
+    client_tls_version: ClientHelloTlsVersion,
+    selected_cipher_suite: [u8; 2],
+    server_key_share: &ServerHelloKeyShare,
+    rng: &SecureRandom,
+    alpn: Option<Vec<u8>>,
+    new_session_tickets: u8,
+) -> Vec<u8> {
+    // ServerHello carries the authenticated digest bytes that the client verifies.
+    let extensions = build_profiled_server_hello_extensions(cached, server_key_share);
+    let extensions_len = extensions.len() as u16;
+
+    let body_len = 2 + 32 + 1 + session_id.len() + 2 + 1 + 2 + extensions.len();
+
+    let mut message = Vec::with_capacity(4 + body_len);
+    message.push(0x02);
+    let len_bytes = (body_len as u32).to_be_bytes();
+    message.extend_from_slice(&len_bytes[1..4]);
+    message.extend_from_slice(&cached.server_hello_template.version);
+    message.extend_from_slice(&[0u8; 32]);
+    message.push(session_id.len() as u8);
+    message.extend_from_slice(session_id);
+    let cipher = if selected_cipher_suite != [0, 0] {
+        selected_cipher_suite
+    } else if cached.server_hello_template.cipher_suite == [0, 0] {
+        [0x13, 0x01]
+    } else {
+        cached.server_hello_template.cipher_suite
+    };
+    message.extend_from_slice(&cipher);
+    message.push(cached.server_hello_template.compression);
+    message.extend_from_slice(&extensions_len.to_be_bytes());
+    message.extend_from_slice(&extensions);
+
+    let mut server_hello = Vec::with_capacity(5 + message.len());
+    server_hello.push(TLS_RECORD_HANDSHAKE);
+    server_hello.extend_from_slice(&TLS_VERSION);
+    server_hello.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    server_hello.extend_from_slice(&message);
+
+    // ChangeCipherSpec is part of the client-visible TLS shim prefix.
+    let change_cipher_spec_count = emulated_change_cipher_spec_count(cached);
+    let mut change_cipher_spec = Vec::with_capacity(change_cipher_spec_count * 6);
+    for _ in 0..change_cipher_spec_count {
+        change_cipher_spec.extend_from_slice(&[
+            TLS_RECORD_CHANGE_CIPHER,
+            TLS_VERSION[0],
+            TLS_VERSION[1],
+            0x00,
+            0x01,
+            0x01,
+        ]);
+    }
+
+    // Telegram clients authenticate the hello prefix and then expose any later
+    // ApplicationData bytes to the MTProto packet parser.
+    let mut sizes = {
+        let base_sizes = emulated_app_data_sizes(cached);
+        match cached.behavior_profile.source {
+            TlsProfileSource::Raw | TlsProfileSource::Merged => base_sizes
+                .into_iter()
+                .map(|size| size.clamp(MIN_APP_DATA, MAX_APP_DATA))
+                .collect(),
+            TlsProfileSource::Default | TlsProfileSource::Rustls => {
+                jitter_and_clamp_sizes(&base_sizes, rng)
+            }
+        }
+    };
+    let compact_payload = if serverhello_compact {
+        cached
+            .cert_info
+            .as_ref()
+            .and_then(build_compact_cert_info_payload)
+            .and_then(hash_compact_cert_info_payload)
+    } else {
+        None
+    };
+    let full_payload = cached
+        .cert_payload
+        .as_ref()
+        .map(|payload| payload.certificate_message.as_slice())
+        .filter(|payload| !payload.is_empty());
+    let selected_payload: Option<&[u8]> = match client_tls_version {
+        ClientHelloTlsVersion::Tls13 => None,
+        ClientHelloTlsVersion::Tls12 => {
+            if serverhello_compact {
+                if use_full_cert_payload {
+                    full_payload.or(compact_payload.as_deref())
+                } else {
+                    compact_payload.as_deref()
+                }
+            } else {
+                full_payload
+            }
+        }
+    };
+
+    if let Some(payload) = selected_payload {
+        sizes = ensure_payload_capacity(sizes, payload.len());
+    }
+
+    let mut app_data = Vec::new();
+    // ALPN selection is encrypted inside EncryptedExtensions in real TLS 1.3.
+    // Keeping the FakeTLS record body opaque avoids a stable plaintext marker.
+    let _ = alpn;
+    let mut payload_offset = 0usize;
+    for size in sizes {
+        let mut rec = Vec::with_capacity(5 + size);
+        rec.push(TLS_RECORD_APPLICATION);
+        rec.extend_from_slice(&TLS_VERSION);
+        rec.extend_from_slice(&(size as u16).to_be_bytes());
+
+        if let Some(payload) = selected_payload {
+            if size > 17 {
+                let body_len = size - 17;
+                let remaining = payload.len().saturating_sub(payload_offset);
+                let copy_len = remaining.min(body_len);
+                if copy_len > 0 {
+                    rec.extend_from_slice(&payload[payload_offset..payload_offset + copy_len]);
+                    payload_offset += copy_len;
+                }
+                if body_len > copy_len {
+                    rec.extend_from_slice(&rng.bytes(body_len - copy_len));
+                }
+                rec.push(0x16);
+                rec.extend_from_slice(&rng.bytes(16));
+            } else {
+                rec.extend_from_slice(&rng.bytes(size));
+            }
+        } else if size > 17 {
+            let body_len = size - 17;
+            let mut body = Vec::with_capacity(body_len);
+            body.extend_from_slice(&rng.bytes(body_len));
+            rec.extend_from_slice(&body);
+            rec.push(0x16);
+            rec.extend_from_slice(&rng.bytes(16));
+        } else {
+            rec.extend_from_slice(&rng.bytes(size));
+        }
+        app_data.extend_from_slice(&rec);
+    }
+
+    // Optional NewSessionTicket mimic records are an explicit fingerprint opt-in.
+    let mut tickets = Vec::new();
+    for ticket_len in emulated_ticket_record_sizes(cached, new_session_tickets, rng) {
+        let mut rec = Vec::with_capacity(5 + ticket_len);
+        rec.push(TLS_RECORD_APPLICATION);
+        rec.extend_from_slice(&TLS_VERSION);
+        rec.extend_from_slice(&(ticket_len as u16).to_be_bytes());
+        rec.extend_from_slice(&rng.bytes(ticket_len));
+        tickets.extend_from_slice(&rec);
+    }
+
+    let mut response = Vec::with_capacity(
+        server_hello.len() + change_cipher_spec.len() + app_data.len() + tickets.len(),
+    );
+    response.extend_from_slice(&server_hello);
+    response.extend_from_slice(&change_cipher_spec);
+    response.extend_from_slice(&app_data);
+    response.extend_from_slice(&tickets);
+
+    // The digest authenticates the server response bytes emitted by this builder.
+    let mut hmac_input = Vec::with_capacity(TLS_DIGEST_LEN + response.len());
+    hmac_input.extend_from_slice(client_digest);
+    hmac_input.extend_from_slice(&response);
+    let digest = sha256_hmac(secret, &hmac_input);
+    response[TLS_DIGEST_POS..TLS_DIGEST_POS + TLS_DIGEST_LEN].copy_from_slice(&digest);
+
+    response
+}
+
+#[cfg(test)]
+#[path = "tests/emulator_security_tests.rs"]
+mod security_tests;
+
+#[cfg(test)]
+#[path = "tests/emulator_profile_fidelity_security_tests.rs"]
+mod emulator_profile_fidelity_security_tests;
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use crate::tls_front::types::{
+        CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsCertPayload, TlsExtension,
+        TlsProfileSource,
+    };
+
+    use super::{
+        build_compact_cert_info_payload, build_emulated_server_hello,
+        hash_compact_cert_info_payload, profiled_server_hello_key_share_group,
+    };
+    use crate::crypto::SecureRandom;
+    use crate::protocol::constants::{
+        TLS_RECORD_APPLICATION, TLS_RECORD_CHANGE_CIPHER, TLS_RECORD_HANDSHAKE,
+    };
+    use crate::protocol::tls::{
+        ClientHelloTlsVersion, ServerHelloKeyShare, TLS_NAMED_GROUP_X25519,
+        TLS_NAMED_GROUP_X25519MLKEM768,
+    };
+
+    fn first_app_data_payload(response: &[u8]) -> &[u8] {
+        let hello_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+        let ccs_start = 5 + hello_len;
+        let ccs_len =
+            u16::from_be_bytes([response[ccs_start + 3], response[ccs_start + 4]]) as usize;
+        let app_start = ccs_start + 5 + ccs_len;
+        let app_len =
+            u16::from_be_bytes([response[app_start + 3], response[app_start + 4]]) as usize;
+        &response[app_start + 5..app_start + 5 + app_len]
+    }
+
+    fn server_hello_cipher_suite(response: &[u8]) -> [u8; 2] {
+        let mut pos = 5 + 4 + 2 + 32;
+        let session_id_len = response[pos] as usize;
+        pos += 1 + session_id_len;
+        [response[pos], response[pos + 1]]
+    }
+
+    fn server_hello_extension_types(response: &[u8]) -> Vec<u16> {
+        let record_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+        let handshake_end = 5 + record_len;
+        let mut pos = 5 + 4 + 2 + 32;
+        let session_id_len = response[pos] as usize;
+        pos += 1 + session_id_len + 2 + 1;
+        let extensions_len = u16::from_be_bytes([response[pos], response[pos + 1]]) as usize;
+        pos += 2;
+        let extensions_end = (pos + extensions_len).min(handshake_end);
+        let mut out = Vec::new();
+
+        while pos + 4 <= extensions_end {
+            let ext_type = u16::from_be_bytes([response[pos], response[pos + 1]]);
+            let ext_len = u16::from_be_bytes([response[pos + 2], response[pos + 3]]) as usize;
+            pos += 4;
+            if pos + ext_len > extensions_end {
+                break;
+            }
+            out.push(ext_type);
+            pos += ext_len;
+        }
+
+        out
+    }
+
+    fn make_cached(cert_payload: Option<TlsCertPayload>) -> CachedTlsData {
+        CachedTlsData {
+            server_hello_template: ParsedServerHello {
+                version: [0x03, 0x03],
+                random: [0u8; 32],
+                session_id: Vec::new(),
+                cipher_suite: [0x13, 0x01],
+                compression: 0,
+                extensions: Vec::new(),
+            },
+            cert_info: None,
+            cert_payload,
+            app_data_records_sizes: vec![64],
+            total_app_data_len: 64,
+            behavior_profile: TlsBehaviorProfile::default(),
+            fetched_at: SystemTime::now(),
+            domain: "example.com".to_string(),
+        }
+    }
+
+    fn test_server_key_share() -> ServerHelloKeyShare {
+        ServerHelloKeyShare::new(TLS_NAMED_GROUP_X25519MLKEM768, vec![0x42; 1120])
+    }
+
+    fn server_key_share_extension_data(group: u16, len: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&group.to_be_bytes());
+        data.extend_from_slice(&(len as u16).to_be_bytes());
+        data.resize(4 + len, 0x42);
+        data
+    }
+
+    #[test]
+    fn profiled_server_hello_key_share_group_reads_raw_x25519_profile() {
+        let mut cached = make_cached(None);
+        cached.behavior_profile.source = TlsProfileSource::Raw;
+        cached.server_hello_template.extensions = vec![
+            TlsExtension {
+                ext_type: 0x002b,
+                data: vec![0x03, 0x04],
+            },
+            TlsExtension {
+                ext_type: 0x0033,
+                data: server_key_share_extension_data(TLS_NAMED_GROUP_X25519, 32),
+            },
+        ];
+
+        assert_eq!(
+            profiled_server_hello_key_share_group(&cached),
+            Some(TLS_NAMED_GROUP_X25519)
+        );
+    }
+
+    #[test]
+    fn profiled_server_hello_key_share_group_ignores_default_profile() {
+        let mut cached = make_cached(None);
+        cached.server_hello_template.extensions = vec![TlsExtension {
+            ext_type: 0x0033,
+            data: server_key_share_extension_data(TLS_NAMED_GROUP_X25519, 32),
+        }];
+
+        assert_eq!(profiled_server_hello_key_share_group(&cached), None);
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_uses_cached_cert_payload() {
+        let cert_msg = vec![0x0b, 0x00, 0x00, 0x05, 0x00, 0xaa, 0xbb, 0xcc, 0xdd];
+        let cached = make_cached(Some(TlsCertPayload {
+            cert_chain_der: vec![vec![0x30, 0x01, 0x00]],
+            certificate_message: cert_msg.clone(),
+        }));
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x11; 32],
+            &[0x22; 16],
+            &cached,
+            true,
+            true,
+            ClientHelloTlsVersion::Tls12,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        assert_eq!(response[0], TLS_RECORD_HANDSHAKE);
+        let hello_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+        let ccs_start = 5 + hello_len;
+        assert_eq!(response[ccs_start], TLS_RECORD_CHANGE_CIPHER);
+        let app_start = ccs_start + 6;
+        assert_eq!(response[app_start], TLS_RECORD_APPLICATION);
+
+        let payload = first_app_data_payload(&response);
+        assert!(payload.starts_with(&cert_msg));
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_uses_selected_cipher_suite() {
+        let cached = make_cached(None);
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x10; 32],
+            &[0x20; 16],
+            &cached,
+            false,
+            true,
+            ClientHelloTlsVersion::Tls13,
+            [0x13, 0x03],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        assert_eq!(server_hello_cipher_suite(&response), [0x13, 0x03]);
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_replays_profiled_safe_extension_order() {
+        let mut cached = make_cached(None);
+        cached.server_hello_template.extensions = vec![
+            TlsExtension {
+                ext_type: 0x002b,
+                data: vec![0x03, 0x04],
+            },
+            TlsExtension {
+                ext_type: 0x0010,
+                data: vec![0x00, 0x03, 0x02, b'h', b'2'],
+            },
+            TlsExtension {
+                ext_type: 0x0033,
+                data: vec![0; 36],
+            },
+        ];
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x21; 32],
+            &[0x22; 16],
+            &cached,
+            false,
+            true,
+            ClientHelloTlsVersion::Tls13,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            Some(b"h2".to_vec()),
+            0,
+        );
+
+        assert_eq!(
+            server_hello_extension_types(&response),
+            vec![0x002b, 0x0033]
+        );
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_replays_safe_raw_extension_order() {
+        let mut cached = make_cached(None);
+        cached.behavior_profile.source = TlsProfileSource::Raw;
+        cached.server_hello_template.extensions = vec![
+            TlsExtension {
+                ext_type: 0x0033,
+                data: server_key_share_extension_data(TLS_NAMED_GROUP_X25519, 32),
+            },
+            TlsExtension {
+                ext_type: 0x002b,
+                data: vec![0x03, 0x04],
+            },
+        ];
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x21; 32],
+            &[0x22; 16],
+            &cached,
+            false,
+            true,
+            ClientHelloTlsVersion::Tls13,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        assert_eq!(
+            server_hello_extension_types(&response),
+            vec![0x0033, 0x002b]
+        );
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_uses_canonical_order_for_unsafe_raw_shape() {
+        let mut cached = make_cached(None);
+        cached.behavior_profile.source = TlsProfileSource::Raw;
+        cached.server_hello_template.extensions = vec![
+            TlsExtension {
+                ext_type: 0x0010,
+                data: vec![0x00, 0x03, 0x02, b'h', b'2'],
+            },
+            TlsExtension {
+                ext_type: 0x0033,
+                data: server_key_share_extension_data(TLS_NAMED_GROUP_X25519, 32),
+            },
+            TlsExtension {
+                ext_type: 0x002b,
+                data: vec![0x03, 0x04],
+            },
+        ];
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x21; 32],
+            &[0x22; 16],
+            &cached,
+            false,
+            true,
+            ClientHelloTlsVersion::Tls13,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        assert_eq!(
+            server_hello_extension_types(&response),
+            vec![0x002b, 0x0033]
+        );
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_random_fallback_when_no_cert_payload() {
+        let cached = make_cached(None);
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x22; 32],
+            &[0x33; 16],
+            &cached,
+            true,
+            true,
+            ClientHelloTlsVersion::Tls12,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        let payload = first_app_data_payload(&response);
+        assert!(payload.len() >= 64);
+        assert_eq!(payload[payload.len() - 17], 0x16);
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_uses_compact_payload_after_first() {
+        let cert_msg = vec![0x0b, 0x00, 0x00, 0x05, 0x00, 0xaa, 0xbb, 0xcc, 0xdd];
+        let mut cached = make_cached(Some(TlsCertPayload {
+            cert_chain_der: vec![vec![0x30, 0x01, 0x00]],
+            certificate_message: cert_msg,
+        }));
+        cached.cert_info = Some(crate::tls_front::types::ParsedCertificateInfo {
+            not_after_unix: Some(1_900_000_000),
+            not_before_unix: Some(1_700_000_000),
+            issuer_cn: Some("Issuer".to_string()),
+            subject_cn: Some("example.com".to_string()),
+            san_names: vec!["example.com".to_string(), "www.example.com".to_string()],
+        });
+
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x44; 32],
+            &[0x55; 16],
+            &cached,
+            false,
+            true,
+            ClientHelloTlsVersion::Tls12,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        let payload = first_app_data_payload(&response);
+        let expected_hashed_payload = build_compact_cert_info_payload(
+            cached
+                .cert_info
+                .as_ref()
+                .expect("test fixture must provide certificate info"),
+        )
+        .and_then(hash_compact_cert_info_payload)
+        .expect("compact certificate info payload must be present for this test");
+        let copied_prefix_len = expected_hashed_payload
+            .len()
+            .min(payload.len().saturating_sub(17));
+        assert_eq!(
+            &payload[..copied_prefix_len],
+            &expected_hashed_payload[..copied_prefix_len]
+        );
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_tls13_never_uses_cert_payload() {
+        let cert_msg = vec![0x0b, 0x00, 0x00, 0x05, 0x00, 0xaa, 0xbb, 0xcc, 0xdd];
+        let cached = make_cached(Some(TlsCertPayload {
+            cert_chain_der: vec![vec![0x30, 0x01, 0x00]],
+            certificate_message: cert_msg.clone(),
+        }));
+
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x56; 32],
+            &[0x78; 16],
+            &cached,
+            true,
+            true,
+            ClientHelloTlsVersion::Tls13,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        let payload = first_app_data_payload(&response);
+        assert!(
+            !payload.starts_with(&cert_msg),
+            "TLS 1.3 response path must not expose certificate payload bytes"
+        );
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_keeps_alpn_marker_out_of_random_payload() {
+        let mut cached = make_cached(None);
+        cached.cert_info = Some(crate::tls_front::types::ParsedCertificateInfo {
+            not_after_unix: Some(1_900_000_000),
+            not_before_unix: Some(1_700_000_000),
+            issuer_cn: Some("Issuer".to_string()),
+            subject_cn: Some("example.com".to_string()),
+            san_names: vec!["example.com".to_string()],
+        });
+
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x90; 32],
+            &[0x91; 16],
+            &cached,
+            false,
+            false,
+            ClientHelloTlsVersion::Tls12,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            Some(b"h2".to_vec()),
+            0,
+        );
+
+        let payload = first_app_data_payload(&response);
+        let expected_alpn_marker = [0x00u8, 0x10, 0x00, 0x05, 0x00, 0x03, 0x02, b'h', b'2'];
+        assert!(
+            !payload.starts_with(&expected_alpn_marker),
+            "random fallback payload must not expose plaintext ALPN marker bytes"
+        );
+    }
+
+    #[test]
+    fn test_build_emulated_server_hello_ignores_tail_records_for_profiled_tls() {
+        let mut cached = make_cached(None);
+        cached.app_data_records_sizes = vec![27, 3905, 537, 69];
+        cached.total_app_data_len = 4538;
+        cached.behavior_profile.source = TlsProfileSource::Merged;
+        cached.behavior_profile.app_data_record_sizes = vec![27, 3905, 537];
+        cached.behavior_profile.ticket_record_sizes = vec![69];
+
+        let rng = SecureRandom::new();
+        let response = build_emulated_server_hello(
+            b"secret",
+            &[0x12; 32],
+            &[0x34; 16],
+            &cached,
+            false,
+            true,
+            ClientHelloTlsVersion::Tls13,
+            [0x13, 0x01],
+            &test_server_key_share(),
+            &rng,
+            None,
+            0,
+        );
+
+        let hello_len = u16::from_be_bytes([response[3], response[4]]) as usize;
+        let ccs_start = 5 + hello_len;
+        let mut pos = ccs_start + 6;
+        let mut app_lens = Vec::new();
+        while pos + 5 <= response.len() {
+            let record_len = u16::from_be_bytes([response[pos + 3], response[pos + 4]]) as usize;
+            assert_eq!(response[pos], TLS_RECORD_APPLICATION);
+            app_lens.push(record_len);
+            pos += 5 + record_len;
+        }
+        assert_eq!(app_lens, vec![64]);
+        assert_eq!(pos, response.len());
+    }
+}

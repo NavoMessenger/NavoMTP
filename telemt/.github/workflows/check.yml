@@ -1,0 +1,155 @@
+name: Check
+
+on:
+  push:
+    branches: [ "*" ]
+  pull_request:
+    branches: [ "*" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+# Rust formatting validation
+  fmt:
+    name: Fmt
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt -- --check
+
+# Minimum supported Rust version validation
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Check all targets on MSRV
+        run: cargo check --all-targets --locked
+
+# Rust test suite
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      actions: write
+      checks: write
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nextest-0.9.143-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-nextest-0.9.143-
+            ${{ runner.os }}-cargo-nextest-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-nextest
+        run: |
+          if ! cargo-nextest --version 2>/dev/null | grep -Fq "cargo-nextest 0.9.143"; then
+            cargo install --locked --version 0.9.143 --force cargo-nextest
+          fi
+
+      - name: Run tests with nextest
+        run: cargo nextest run -j "$(nproc)"
+
+# Rust lint validation
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      checks: write
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-clippy-
+            ${{ runner.os }}-cargo-
+
+      - name: Run clippy
+        run: cargo clippy -j "$(nproc)" -- --cap-lints warn
+
+# Unused dependency validation
+  udeps:
+    name: Udeps
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-udeps-0.1.61-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-udeps-0.1.61-
+            ${{ runner.os }}-cargo-udeps-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-udeps
+        run: |
+          if ! cargo-udeps --version 2>/dev/null | grep -Fq "cargo-udeps 0.1.61"; then
+            cargo install --locked --version 0.1.61 --force cargo-udeps
+          fi
+
+      - name: Run udeps
+        run: cargo udeps -j "$(nproc)" || true

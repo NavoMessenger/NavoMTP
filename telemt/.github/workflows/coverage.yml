@@ -1,0 +1,53 @@
+name: Coverage
+
+on:
+  pull_request:
+    branches: [ "*" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: LLVM coverage report
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: actions/cache@v6.1.0
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-llvm-cov-0.9.0-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-llvm-cov-0.9.0-
+            ${{ runner.os }}-cargo-llvm-cov-
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-llvm-cov
+        run: |
+          if ! cargo-llvm-cov --version 2>/dev/null | grep -Fq "cargo-llvm-cov 0.9.0"; then
+            cargo install --locked --version 0.9.0 --force cargo-llvm-cov
+          fi
+
+      - name: Generate LCOV report
+        run: cargo llvm-cov --locked --lcov --output-path lcov.info
+
+      - name: Upload LCOV report
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: telemt-lcov
+          path: lcov.info

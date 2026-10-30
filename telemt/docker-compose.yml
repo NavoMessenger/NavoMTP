@@ -1,0 +1,45 @@
+services:
+  telemt:
+    image: ghcr.io/telemt/telemt:latest
+    build:
+      context: .
+      target: prod
+    container_name: telemt
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "127.0.0.1:9090:9090"
+      - "127.0.0.1:9091:9091"
+    # Working dir uses tmpfs for caching 'proxy-secret' at runtime.
+    # Config is mounted as a directory (not a single file) so the API can
+    # atomically update config.toml via write-temp → rename within the same FS.
+    working_dir: /run/telemt
+    command: ["/etc/telemt/config.toml"]
+    volumes:
+      - ./config:/etc/telemt:rw
+    tmpfs:
+      - /run/telemt:rw,mode=1777,size=4m
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: [ "CMD", "/app/telemt", "healthcheck", "/etc/telemt/config.toml", "--mode", "liveness" ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 262144
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"

@@ -1,0 +1,113 @@
+[package]
+name = "telemt"
+version = "3.5.14"
+edition = "2024"
+rust-version = "1.88"
+
+[features]
+redteam_offline_expected_fail = []
+
+[dependencies]
+# C
+libc = "0.2.189"
+
+# Async runtime
+tokio = { version = "1.53.1", features = ["full", "tracing"] }
+tokio-util = { version = "0.7.19", features = ["full"] }
+
+# Crypto
+aes = { version = "0.8.4", features = ["zeroize"] }
+ctr = { version = "0.9.2", features = ["zeroize"] }
+cbc = "0.1.2"
+sha2 = "0.10.9"
+sha1 = "0.10.7"
+md-5 = "0.10.6"
+hmac = "0.12.1"
+crc32fast = "1.5.1"
+crc32c = "0.6.8"
+zeroize = { version = "1.9.0", features = ["derive"] }
+subtle = "2.6.1"
+static_assertions = "1.1.0"
+ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"] }
+
+# Network
+socket2 = { version = "0.6.5", features = ["all"] }
+nix = { version = "0.31.3", default-features = false, features = [
+  "net",
+  "user",
+  "process",
+  "dir",
+  "fs",
+  "signal",
+] }
+shadowsocks = { version = "1.24.0", default-features = false, features = [
+  "aead-cipher",
+  "aead-cipher-2022",
+] }
+
+# Serialization
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.5"
+x509-parser = "0.18.1"
+
+# Utils
+bytes = "1.12.1"
+thiserror = "2.0.20"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.5"
+parking_lot = "0.12.5"
+dashmap = "6.2.1"
+arc-swap = "1.9.2"
+lru = "0.18.4"
+rand = "0.10.2"
+chrono = { version = "0.4.45", features = ["serde"] }
+hex = "0.4.3"
+base64 = "0.22.1"
+url = "2.5.8"
+regex = "1.13.1"
+crossbeam-queue = "0.3.14"
+num-bigint = "0.4.8"
+num-traits = "0.2.19"
+x25519-dalek = "2.0.1"
+anyhow = "1.0.104"
+
+# HTTP
+reqwest = { version = "0.13.4", features = ["rustls"], default-features = false }
+notify = "8.2.0"
+ipnetwork = { version = "0.21.1", features = ["serde"] }
+hyper = { version = "1.11.1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "server-auto"] }
+http-body-util = "0.1.5"
+httpdate = "1.0.3"
+tokio-tungstenite = { version = "0.30.0", default-features = false }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+tokio-rustls = { version = "0.26.5", default-features = false, features = [
+  "tls12",
+] }
+rustls = { version = "0.23.43", default-features = false, features = [
+  "std",
+  "tls12",
+  "ring",
+] }
+webpki-roots = "1.0.9"
+
+[dev-dependencies]
+tokio-test = "0.4.5"
+criterion = "0.8.2"
+proptest = "1.11.0"
+futures = "0.3.34"
+tempfile = "3.27.0"
+
+[[bench]]
+name = "crypto_bench"
+harness = false
+
+[[bench]]
+name = "web_decoy_fasttrack"
+harness = false
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

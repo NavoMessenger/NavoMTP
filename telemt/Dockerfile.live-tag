@@ -1,0 +1,15 @@
+FROM rust:bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake clang perl pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --locked --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /src/target/release/telemt /app/telemt
+USER 65532:65532
+ENTRYPOINT ["/app/telemt"]
+CMD ["/etc/telemt/telemt.toml"]
