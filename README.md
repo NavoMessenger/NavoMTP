@@ -92,6 +92,8 @@ The current IPv4 ingress uses one native Telemt `[access.cidr_rate_limits]` buck
 
 Both limits default to unlimited, including existing deployments without saved limits. Run `sudo bash navomtp.sh configure` to change them or enter `0` to remove either limit; `status` displays both. Image updates preserve the settings. If the current Telemt image does not recognize the limit fields, validation stops before replacing the deployment; use the existing `update` command to upgrade and retry.
 
+The menu displays links directly in the terminal without a dialog box, keeping each URL on one logical line for copying; press Enter to return.
+
 After deployment, NavoMTP prints `tg://proxy` and `https://t.me/proxy` links for every public port. These links contain the proxy secret and should not be posted publicly.
 
 ### Multiple ad tags and connection groups
@@ -110,11 +112,12 @@ To migrate an older per-group deployment, run `configure`: the former group 1 li
 
 Run `sudo bash navomtp.sh rotation` or select **Configure scheduled tag rotation** in the menu. Select an existing connection group, then choose:
 
-- `fixed`: stop rotation for that group and keep the current tag (use `configure` to change or clear it).
 - `sequence`: cycle through the tag list in order.
 - `random`: randomly select another tag at each interval, avoiding consecutive repeats.
 
-For either rotation mode, enter 2–100 unique, nonzero 32-character hexadecimal tags separated by commas, and an interval of 1–10080 minutes (default 30). Use valid tags obtained through `@MTProxybot`. If the current tag is in the pool, it stays active until the first interval expires; otherwise the first tag becomes active when configuration is deployed. Each group has its own pool and schedule. The proxy secret, public address, ports, and camouflage domain remain unchanged, so existing links continue to work. Overall upload/download limits remain shared.
+A single tag in either mode keeps that tag fixed, skips the interval prompt, and needs no rotation timer. Existing `fixed` configurations remain compatible. Use `configure` to clear a tag.
+
+For either rotation mode, enter 1–100 unique, nonzero 32-character hexadecimal tags separated by commas, and an interval of 1–10080 minutes (default 30). Use valid tags obtained through `@MTProxybot`. If the current tag is in the pool, it stays active until the first interval expires; otherwise the first tag becomes active when configuration is deployed. Each group has its own pool and schedule. The proxy secret, public address, ports, and camouflage domain remain unchanged, so existing links continue to work. Overall upload/download limits remain shared.
 
 Initial configuration rebuilds containers to use a read-only directory mount and may briefly interrupt connections. Subsequent scheduled changes use Telemt hot reload and do not deliberately disconnect clients. They apply to new proxy sessions; existing sessions and Telegram's sponsored-channel display are not guaranteed to switch immediately. This is scheduled rotation, not random selection for every new connection.
 

@@ -204,10 +204,16 @@ sync_first_group() {
 }
 
 group_summary() {
-  local i tag
+  local i tag mode
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
     tag="$(group_value TAG "$i")"
     printf '组 %s | ad_tag：%s\n' "$((i+1))" "${tag:-未设置}"
+    mode="${ROT_MODES[$i]:-fixed}"
+    [[ "$mode" != fixed ]] || mode=sequence
+    if ! group_rotation_enabled "$i"; then
+      printf '  tag 模式：%s | 固定使用单个 tag（未设置 tag 时不推广）\n' "$mode"
+      continue
+    fi
     printf '  tag 模式：%s | 间隔：%s 分钟 | 下次执行时间戳：%s\n' \
       "${ROT_MODES[$i]:-fixed}" "${ROT_MINUTES[$i]:-30}" "${ROT_NEXT[$i]:-0}"
   done
@@ -1015,11 +1021,12 @@ show_links() {
   load_state
   [[ -s "$INSTALL_DIR/links.txt" ]] || write_links
   [[ -s "$INSTALL_DIR/links.txt" ]] || die "暂时无法取得 Telemt 官方生成链接，请检查日志后重试。"
-  if [[ "$use_dialog" == true && -t 1 ]]; then
-    whiptail --title "连接链接（敏感信息）" --scrolltext --msgbox "$(<"$INSTALL_DIR/links.txt")" 24 90
-  else
-    printf '\n连接链接（包含密钥，请勿公开）：\n\n'
-    cat "$INSTALL_DIR/links.txt"
+  # Keep each URL on one logical terminal line. Whiptail inserts hard wraps
+  # and padding that become part of links copied from its message box.
+  printf '\n连接链接（包含密钥，请勿公开）：\n\n'
+  cat "$INSTALL_DIR/links.txt"
+  if [[ "$use_dialog" == true && -t 0 && -t 1 ]]; then
+    read -r -p '复制完成后按 Enter 返回菜单…' _ || true
   fi
 }
 
@@ -1125,7 +1132,7 @@ normalize_tag_pool() {
   local -a tags
   [[ "$raw" != ,* && "$raw" != *, && "$raw" != *,,* ]] || return 1
   IFS=, read -r -a tags <<< "$raw"
-  (( ${#tags[@]} >= 2 && ${#tags[@]} <= 100 )) || return 1
+  (( ${#tags[@]} >= 1 && ${#tags[@]} <= 100 )) || return 1
   for tag in "${tags[@]}"; do
     validate_hex32 "$tag" || return 1
     tag="$(lowercase "$tag")"
@@ -1150,6 +1157,10 @@ next_rotation_tag() {
   local mode="$1" current="$2" pool="$3" i index=-1 random_value
   local -a tags candidates=()
   IFS=, read -r -a tags <<< "$pool"
+  if (( ${#tags[@]} == 1 )); then
+    printf '%s' "${tags[0]}"
+    return 0
+  fi
   for ((i=0; i<${#tags[@]}; i++)); do
     [[ "${tags[$i]}" != "$current" ]] || index="$i"
     [[ "${tags[$i]}" == "$current" ]] || candidates+=("${tags[$i]}")
@@ -1163,10 +1174,16 @@ next_rotation_tag() {
   fi
 }
 
+# Legacy fixed states stay readable; a single-tag pool never needs a timer.
+group_rotation_enabled() {
+  local i="$1" mode="${ROT_MODES[$1]:-fixed}"
+  [[ "$mode" == sequence || "$mode" == random ]] && [[ "${ROT_POOLS[$i]:-}" == *,* ]]
+}
+
 rotation_enabled() {
   local i
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
-    [[ "${ROT_MODES[$i]:-fixed}" == fixed ]] || return 0
+    if group_rotation_enabled "$i"; then return 0; fi
   done
   return 1
 }
@@ -1213,21 +1230,26 @@ configure_rotation() {
   ensure_docker
   require_installation
   load_state
-  local value i mode pool minutes current
+  local value i mode pool minutes current next
   value="$(dialog_input '轮换连接组' "选择组编号（1–${GROUP_COUNT}），组内链接和密钥保持不变：" 1)" || return 0
   [[ "$value" =~ ^[0-9]{1,3}$ ]] && (( 10#$value >= 1 && 10#$value <= GROUP_COUNT )) || { warn '连接组编号无效。'; return 1; }
   i=$((10#$value-1))
-  mode="$(dialog_input 'tag 模式' 'fixed：固定（停用轮换）；sequence：定时顺序；random：定时随机，避免连续重复：' "${ROT_MODES[$i]:-fixed}")" || return 0
+  mode="${ROT_MODES[$i]:-sequence}"
+  [[ "$mode" != fixed ]] || mode=sequence
+  mode="$(dialog_input 'tag 模式' 'sequence：定时顺序；random：定时随机，避免连续重复。任一模式只填一个 tag 即固定使用：' "$mode")" || return 0
   case "$mode" in
-    fixed) ROT_MODES[i]=fixed; ROT_POOLS[i]=''; ROT_NEXT[i]=0 ;;
     sequence|random)
-      value="$(dialog_input 'tag 列表' '填写 2–100 个不同的有效 tag，用英文逗号分隔，不含空格；不能使用全零 tag：' "${ROT_POOLS[$i]:-}")" || return 0
+      value="$(dialog_input 'tag 列表' '填写 1–100 个不同的有效 tag，用英文逗号分隔，不含空格；一个 tag 即固定使用；不能使用全零 tag：' "${ROT_POOLS[$i]:-${GROUP_TAGS[$i]}}")" || return 0
       pool="$(normalize_tag_pool "$value")" || { warn 'tag 列表无效或有重复。'; return 1; }
-      minutes="$(dialog_input '轮换间隔' '间隔分钟数（1–10080）；约每分钟检查到期组。新会话生效，已有连接不强制断开：' "${ROT_MINUTES[$i]:-30}")" || return 0
-      [[ "$minutes" =~ ^[1-9][0-9]{0,4}$ ]] && (( minutes <= 10080 )) || { warn '间隔无效。'; return 1; }
+      minutes="${ROT_MINUTES[$i]:-30}" next=0
+      if [[ "$pool" == *,* ]]; then
+        minutes="$(dialog_input '轮换间隔' '间隔分钟数（1–10080）；约每分钟检查到期组。新会话生效，已有连接不强制断开：' "$minutes")" || return 0
+        [[ "$minutes" =~ ^[1-9][0-9]{0,4}$ ]] && (( minutes <= 10080 )) || { warn '间隔无效。'; return 1; }
+        next="$(( $(date +%s) + minutes*60 ))"
+      fi
       current="${GROUP_TAGS[$i]}"
       [[ ",$pool," == *",$current,"* ]] || current="${pool%%,*}"
-      GROUP_TAGS[i]="$current" ROT_MODES[i]="$mode" ROT_POOLS[i]="$pool" ROT_MINUTES[i]="$minutes" ROT_NEXT[i]="$(( $(date +%s) + minutes*60 ))"
+      GROUP_TAGS[i]="$current" ROT_MODES[i]="$mode" ROT_POOLS[i]="$pool" ROT_MINUTES[i]="$minutes" ROT_NEXT[i]="$next"
       ;;
     *) warn '模式无效。'; return 1 ;;
   esac
@@ -1274,7 +1296,7 @@ rotate_tags() {
   local now i changed=0 staging journal="$INSTALL_DIR/.rotation-transaction" since
   now="$(date +%s)"
   for ((i=0; i<GROUP_COUNT; i++)); do
-    [[ "${ROT_MODES[$i]:-fixed}" != fixed ]] || continue
+    group_rotation_enabled "$i" || continue
     (( now >= ${ROT_NEXT[$i]} )) || continue
     GROUP_TAGS[i]="$(next_rotation_tag "${ROT_MODES[$i]}" "${GROUP_TAGS[$i]}" "${ROT_POOLS[$i]}")" || return 1
     ROT_NEXT[i]="$((now + ${ROT_MINUTES[$i]}*60))"

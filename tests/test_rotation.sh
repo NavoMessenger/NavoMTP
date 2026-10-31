@@ -34,7 +34,17 @@ test_case() (
     pool) [[ "$(normalize_tag_pool "$a,$b")" == "$a,$b" ]] ;;
     duplicate) ! normalize_tag_pool "$a,$a" ;;
     malformed) ! normalize_tag_pool "$a,invalid" ;;
-    singleton) ! normalize_tag_pool "$a" ;;
+    singleton) [[ "$(normalize_tag_pool "$a")" == "$a" ]] ;;
+    singleton-sequence|singleton-random)
+      local mode="${scenario#singleton-}"
+      [[ "$(next_rotation_tag "$mode" "$b" "$a")" == "$a" ]] || return 1
+      ROT_MODES=("$mode") ROT_POOLS=("$a") ROT_NEXT=(0)
+      validate_groups || return 1
+      ! rotation_enabled || return 1
+      render_state "$INSTALL_DIR/state.env"
+      old_state="$(<"$INSTALL_DIR/state.env")"
+      rotate_tags || return 1
+      [[ "$(<"$INSTALL_DIR/state.env")" == "$old_state" && "$(<"$INSTALL_DIR/config/telemt.toml")" == "$old_config" ]] ;;
     zero) ! normalize_tag_pool "$a,00000000000000000000000000000000" ;;
     trailing-comma) ! normalize_tag_pool "$a,$b," ;;
     sequence) [[ "$(next_rotation_tag sequence "$a" "$a,$b,$c")" == "$b" ]] ;;
@@ -98,7 +108,7 @@ test_case() (
       grep -q 'OnUnitActiveSec=60s' "$SYSTEMD_DIR/navomtp-rotation.timer" || return 1
       grep -q 'ExecStart=/bin/bash /opt/navomtp/navomtp.sh rotate' "$SYSTEMD_DIR/navomtp-rotation.service" || return 1
       grep -q 'enable --now navomtp-rotation.timer' "$SYSTEMD_DIR/calls" || return 1
-      ROT_MODES=(fixed)
+      ROT_MODES=(random) ROT_POOLS=("$a")
       sync_rotation_timer || return 1
       [[ ! -e "$SYSTEMD_DIR/navomtp-rotation.timer" ]] ;;
     mount)
@@ -111,24 +121,24 @@ test_case() (
       local directory_mode
       directory_mode="$(stat -c '%a' "$INSTALL_DIR/permissions" 2>/dev/null || stat -f '%Lp' "$INSTALL_DIR/permissions")"
       [[ "$directory_mode" == 750 ]] ;;
-    configure-sequence|configure-fixed)
+    configure-sequence|configure-single-sequence|configure-single-random)
       require_supported_host() { return 0; }
       install_base_dependencies() { return 0; }
       ensure_docker() { return 0; }
       dialog_input() {
         case "$1" in
           '轮换连接组') printf 1 ;;
-          'tag 模式') if [[ "$scenario" == configure-fixed ]]; then printf fixed; else printf sequence; fi ;;
-          'tag 列表') printf '%s' "$a,$b,$c" ;;
-          '轮换间隔') printf 10 ;;
+          'tag 模式') if [[ "$scenario" == configure-single-random ]]; then printf random; else printf sequence; fi ;;
+          'tag 列表') if [[ "$scenario" == configure-single-* ]]; then printf '%s' "$a"; else printf '%s' "$a,$b,$c"; fi ;;
+          '轮换间隔') [[ "$scenario" != configure-single-* ]] || return 1; printf 10 ;;
         esac
       }
       dialog_yesno() { return 0; }
       deploy_configuration() {
         touch "$INSTALL_DIR/deploy-called"
         [[ "${GROUP_SECRETS[0]}" == 11111111111111111111111111111111 && "${GROUP_TAGS[0]}" == "$a" ]] || return 1
-        if [[ "$scenario" == configure-fixed ]]; then
-          [[ "${ROT_MODES[0]}" == fixed && "${ROT_NEXT[0]}" == 0 ]]
+        if [[ "$scenario" == configure-single-* ]]; then
+          [[ "${ROT_MODES[0]}" == "${scenario#configure-single-}" && "${ROT_POOLS[0]}" == "$a" && "${ROT_NEXT[0]}" == 0 ]]
         else
           [[ "${ROT_MODES[0]}" == sequence && "${ROT_MINUTES[0]}" == 10 && "${ROT_NEXT[0]}" -gt "$(date +%s)" ]]
         fi
@@ -138,7 +148,7 @@ test_case() (
   esac
 )
 
-for scenario in pool duplicate malformed singleton zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery multi-due timer mount directory-permissions configure-sequence configure-fixed; do
+for scenario in pool duplicate malformed singleton singleton-sequence singleton-random zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery multi-due timer mount directory-permissions configure-sequence configure-single-sequence configure-single-random; do
   check "$scenario" test_case "$scenario"
 done
 printf '1..%s\n' "$((pass+fail))"
