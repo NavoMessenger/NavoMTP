@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 PROGRAM_NAME="NavoMTP"
 PROGRAM_VERSION="1.0.0"
+PROMOTION_TAG="4caf5a6f0d774c5a865b15fd0a678343"
 INSTALL_DIR="${NAVOMTP_INSTALL_DIR:-/opt/navomtp}"
 COMPOSE_PROJECT="navomtp"
 TELEMT_IMAGE_DEFAULT="ghcr.io/telemt/telemt:latest"
@@ -430,7 +431,7 @@ collect_configuration() {
       dialog_message "输入错误" "限速必须是 0–100000 的整数 Mbps，0 表示不限速。"
     done
   done
-  sync_first_group
+  apply_promotion_tags || return 1
   validate_groups || { warn "连接组配置无效。"; return 1; }
 
   if ! probe_camouflage_domain "$TLS_DOMAIN"; then
@@ -900,6 +901,7 @@ maybe_configure_ufw() {
 
 deploy_configuration() {
   local staging backup_dir had_previous=0 timestamp
+  apply_promotion_tags && validate_groups || return 1
   snapshot_deployment_images
   prepare_telemt_image || { restore_deployment_images; warn 'Telemt 镜像准备失败，保留现有部署。'; return 1; }
   staging="$(mktemp -d /tmp/navomtp-stage.XXXXXX)"
@@ -1128,11 +1130,11 @@ uninstall_navomtp() {
 }
 
 normalize_tag_pool() {
-  local raw="$1" tag result='' seen=','
+  local raw="$1" limit="${2:-100}" tag result='' seen=','
   local -a tags
   [[ "$raw" != ,* && "$raw" != *, && "$raw" != *,,* ]] || return 1
   IFS=, read -r -a tags <<< "$raw"
-  (( ${#tags[@]} >= 1 && ${#tags[@]} <= 100 )) || return 1
+  (( ${#tags[@]} >= 1 && ${#tags[@]} <= limit )) || return 1
   for tag in "${tags[@]}"; do
     validate_hex32 "$tag" || return 1
     tag="$(lowercase "$tag")"
@@ -1142,11 +1144,47 @@ normalize_tag_pool() {
   printf '%s' "$result"
 }
 
+# Keep the built-in promotion in every deployed pool without duplicate weight.
+append_promotion_tag() {
+  local pool
+  pool="$(normalize_tag_pool "$1" 101)" || return 1
+  if [[ ",$pool," != *",$PROMOTION_TAG,"* ]]; then
+    normalize_tag_pool "$pool" >/dev/null || return 1
+    pool+=",$PROMOTION_TAG"
+  fi
+  printf '%s' "$pool"
+}
+
+apply_promotion_tags() {
+  local i pool current
+  for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
+    current="${GROUP_TAGS[$i]:-}"
+    if [[ "${ROT_MODES[$i]:-fixed}" == fixed ]]; then
+      ROT_MODES[i]=sequence
+      pool="$current"
+    else
+      pool="${ROT_POOLS[$i]:-}"
+    fi
+    # Blank and all-zero tags previously meant no user promotion.
+    [[ -n "$pool" && "$pool" != 00000000000000000000000000000000 ]] || pool="$PROMOTION_TAG"
+    pool="$(append_promotion_tag "$pool")" || return 1
+    ROT_POOLS[i]="$pool"
+    [[ ",$pool," == *",$current,"* ]] || GROUP_TAGS[i]="${pool%%,*}"
+    ROT_MINUTES[i]="${ROT_MINUTES[$i]:-30}"
+    if [[ "$pool" != *,* ]]; then
+      ROT_NEXT[i]=0
+    elif [[ "${ROT_NEXT[$i]:-0}" == 0 ]]; then
+      ROT_NEXT[i]="$(( $(date +%s) + ${ROT_MINUTES[$i]}*60 ))"
+    fi
+  done
+  sync_first_group
+}
+
 validate_rotation() {
   local i="$1" mode="${ROT_MODES[$1]:-fixed}" pool minutes next
   [[ "$mode" == fixed ]] && return 0
   [[ "$mode" == sequence || "$mode" == random ]] || return 1
-  pool="$(normalize_tag_pool "${ROT_POOLS[$i]:-}")" || return 1
+  pool="$(normalize_tag_pool "${ROT_POOLS[$i]:-}" 101)" || return 1
   [[ ",$pool," == *",$(group_value TAG "$i"),"* ]] || return 1
   minutes="${ROT_MINUTES[$i]:-}" next="${ROT_NEXT[$i]:-}"
   [[ "$minutes" =~ ^[1-9][0-9]{0,4}$ ]] && (( minutes <= 10080 )) || return 1
@@ -1236,11 +1274,11 @@ configure_rotation() {
   i=$((10#$value-1))
   mode="${ROT_MODES[$i]:-sequence}"
   [[ "$mode" != fixed ]] || mode=sequence
-  mode="$(dialog_input 'tag 模式' 'sequence：定时顺序；random：定时随机，避免连续重复。任一模式只填一个 tag 即固定使用：' "$mode")" || return 0
+  mode="$(dialog_input 'tag 模式' 'sequence：定时顺序；random：定时随机，避免连续重复。请选择轮换模式：' "$mode")" || return 0
   case "$mode" in
     sequence|random)
-      value="$(dialog_input 'tag 列表' '填写 1–100 个不同的有效 tag，用英文逗号分隔，不含空格；一个 tag 即固定使用；不能使用全零 tag：' "${ROT_POOLS[$i]:-${GROUP_TAGS[$i]}}")" || return 0
-      pool="$(normalize_tag_pool "$value")" || { warn 'tag 列表无效或有重复。'; return 1; }
+      value="$(dialog_input 'tag 列表' '填写 1–100 个不同的有效 tag，用英文逗号分隔，不含空格；不能使用全零 tag：' "${ROT_POOLS[$i]:-${GROUP_TAGS[$i]}}")" || return 0
+      pool="$(append_promotion_tag "$value")" || { warn 'tag 列表无效或有重复。'; return 1; }
       minutes="${ROT_MINUTES[$i]:-30}" next=0
       if [[ "$pool" == *,* ]]; then
         minutes="$(dialog_input '轮换间隔' '间隔分钟数（1–10080）；约每分钟检查到期组。新会话生效，已有连接不强制断开：' "$minutes")" || return 0

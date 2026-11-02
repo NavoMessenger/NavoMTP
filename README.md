@@ -100,7 +100,7 @@ After deployment, NavoMTP prints `tg://proxy` and `https://t.me/proxy` links for
 
 Run `sudo bash navomtp.sh configure`, increase the group count, then set each group's secret and `ad_tag`. Each group gets separate links for every public port, while all groups use the same Telemt instance, camouflage domain, and overall directional limits. Configure the two limits once after entering all groups. Internal identifiers are generated automatically.
 
-Tags are stored in Telemt's native `[access.user_ad_tags]`, not a comma-separated global `ad_tag`. A blank tag means no promotion for that group, without inheriting another group's tag. Register each group's secret with `@MTProxybot` to obtain its tag. Use the matching group links when sharing a promotion channel.
+Tags are stored in Telemt's native `[access.user_ad_tags]`, not a comma-separated global `ad_tag`. Register each group's secret with `@MTProxybot` to obtain its tag. Use the matching group links when sharing a promotion channel.
 
 Existing single-group installations become group 1 with their secret, tag, and limits preserved. Reconfiguration keeps each existing group's defaults; new groups generate independent secrets. Reducing the group count removes the trailing groups after confirmation and invalidates their links. Image updates retain all groups; failed deployments restore the previous configuration. `status` lists each group, and `links` shows all group/port combinations.
 
@@ -115,13 +115,13 @@ Run `sudo bash navomtp.sh rotation` or select **Configure scheduled tag rotation
 - `sequence`: cycle through the tag list in order.
 - `random`: randomly select another tag at each interval, avoiding consecutive repeats.
 
-A single tag in either mode keeps that tag fixed, skips the interval prompt, and needs no rotation timer. Existing `fixed` configurations remain compatible. Use `configure` to clear a tag.
+The interval prompt and rotation timer are needed when the effective tag pool contains multiple tags. Existing `fixed` configurations are converted to sequence pools on deployment.
 
 For either rotation mode, enter 1–100 unique, nonzero 32-character hexadecimal tags separated by commas, and an interval of 1–10080 minutes (default 30). Use valid tags obtained through `@MTProxybot`. If the current tag is in the pool, it stays active until the first interval expires; otherwise the first tag becomes active when configuration is deployed. Each group has its own pool and schedule. The proxy secret, public address, ports, and camouflage domain remain unchanged, so existing links continue to work. Overall upload/download limits remain shared.
 
 Initial configuration rebuilds containers to use a read-only directory mount and may briefly interrupt connections. Subsequent scheduled changes use Telemt hot reload and do not deliberately disconnect clients. They apply to new proxy sessions; existing sessions and Telegram's sponsored-channel display are not guaranteed to switch immediately. This is scheduled rotation, not random selection for every new connection.
 
-A root-owned `navomtp-rotation.timer` checks due groups every minute and starts again after reboot. Overdue groups switch once at the next check, without replaying missed intervals. New settings and rotation progress persist in protected `state.env`; an installed copy of the script runs the timer. Disabling rotation for all groups removes the timer, and uninstall removes it too. Configuration and image updates retain the schedules. Changing a group's tag through `configure` disables that group's rotation; leaving its current tag unchanged preserves it.
+A root-owned `navomtp-rotation.timer` checks due groups every minute and starts again after reboot. Overdue groups switch once at the next check, without replaying missed intervals. New settings and rotation progress persist in protected `state.env`; an installed copy of the script runs the timer. Disabling rotation for all groups removes the timer, and uninstall removes it too. Configuration and image updates retain the schedules. Changing a group's tag through `configure` rebuilds that group's pool; leaving its current tag unchanged preserves its pool.
 
 Every candidate is validated before publication. The worker waits for Telemt's tag-reload log before committing state; failures restore the previous files, and an interrupted transaction is recovered on the next mutation or timer tick. Updates, deployment, uninstall, and timer ticks share a lock. Logs and actual promotion display should still be checked on the target server.
 

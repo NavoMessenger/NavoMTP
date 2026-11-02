@@ -130,7 +130,7 @@ test_case() (
           '轮换连接组') printf 1 ;;
           'tag 模式') if [[ "$scenario" == configure-single-random ]]; then printf random; else printf sequence; fi ;;
           'tag 列表') if [[ "$scenario" == configure-single-* ]]; then printf '%s' "$a"; else printf '%s' "$a,$b,$c"; fi ;;
-          '轮换间隔') [[ "$scenario" != configure-single-* ]] || return 1; printf 10 ;;
+          '轮换间隔') printf 10 ;;
         esac
       }
       dialog_yesno() { return 0; }
@@ -138,7 +138,7 @@ test_case() (
         touch "$INSTALL_DIR/deploy-called"
         [[ "${GROUP_SECRETS[0]}" == 11111111111111111111111111111111 && "${GROUP_TAGS[0]}" == "$a" ]] || return 1
         if [[ "$scenario" == configure-single-* ]]; then
-          [[ "${ROT_MODES[0]}" == "${scenario#configure-single-}" && "${ROT_POOLS[0]}" == "$a" && "${ROT_NEXT[0]}" == 0 ]]
+          [[ "${ROT_MODES[0]}" == "${scenario#configure-single-}" && "${ROT_POOLS[0]}" == "$a,$PROMOTION_TAG" && "${ROT_MINUTES[0]}" == 10 && "${ROT_NEXT[0]}" -gt "$(date +%s)" ]]
         else
           [[ "${ROT_MODES[0]}" == sequence && "${ROT_MINUTES[0]}" == 10 && "${ROT_NEXT[0]}" -gt "$(date +%s)" ]]
         fi

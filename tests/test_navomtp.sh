@@ -247,6 +247,7 @@ test_rate_update() (
   docker() { printf 'test-image-id'; }
   compose() { return 0; }
   verify_images_and_staging() { [[ "$UPLOAD_LIMIT_MBPS" == 12 && "$DOWNLOAD_LIMIT_MBPS" == 34 ]]; }
+  sync_rotation_timer() { return 0; }
   wait_for_healthy() { return 0; }
   record_image_digests() { return 0; }
   write_links() { return 0; }
@@ -254,7 +255,8 @@ test_rate_update() (
   maybe_configure_ufw() { return 0; }
   install_staging() { cp -Rp "$1/." "$INSTALL_DIR/"; }
   update_images || return 1
-  [[ "$(<"$INSTALL_DIR/config/telemt.toml")" == "$original" ]]
+  [[ "$(<"$INSTALL_DIR/config/telemt.toml")" == "$original" ]] || return 1
+  [[ "${ROT_POOLS[0]}" == *"$PROMOTION_TAG"* ]]
 )
 assert_success "image update loads and preserves independent rates" test_rate_update
 
@@ -423,6 +425,7 @@ test_multi_groups() (
       docker() { printf 'test-image'; }
       compose() { return 0; }
       verify_images_and_staging() { [[ "$GROUP_COUNT" == 2 && "$UPLOAD_LIMIT_MBPS" == 12 && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]]; }
+      sync_rotation_timer() { return 0; }
       wait_for_healthy() { return 0; }
       record_image_digests() { return 0; }
       write_links() { return 0; }
@@ -430,7 +433,9 @@ test_multi_groups() (
       maybe_configure_ufw() { return 0; }
       install_staging() { cp -Rp "$1/." "$INSTALL_DIR/"; }
       update_images || return 1
-      [[ "$(<"$INSTALL_DIR/state.env")" == "$original" ]] ;;
+      load_state || return 1
+      [[ "$GROUP_COUNT" == 2 && "${GROUP_TAGS[0]}" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa && "${GROUP_TAGS[1]}" == "$PROMOTION_TAG" ]] || return 1
+      [[ "${ROT_POOLS[0]}" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,$PROMOTION_TAG" && "${ROT_POOLS[1]}" == "$PROMOTION_TAG" ]] ;;
     wizard-add|wizard-remove|wizard-cancel)
       original="$(<"$INSTALL_DIR/state.env")"
       dialog_input() {
