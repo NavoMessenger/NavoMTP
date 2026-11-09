@@ -58,6 +58,19 @@ test_case() (
     validate-invalid-interval) ROT_MINUTES=(0); ! validate_groups ;;
     validate-invalid-mode) ROT_MODES=(bad); ! validate_groups ;;
     validate-current-missing) ROT_POOLS=("$b,$c"); ! validate_groups ;;
+    removed-roundtrip|removed-blank|removed-single)
+      PROMOTION_DISABLED=(1)
+      case "$scenario" in
+        removed-blank) GROUP_TAGS=('') ROT_MODES=(fixed) ROT_POOLS=('') ROT_NEXT=(0) ;;
+        removed-single) ROT_POOLS=("$a") ROT_NEXT=(0) ;;
+      esac
+      sync_first_group
+      render_state "$INSTALL_DIR/state.env"
+      load_state || return 1
+      apply_promotion_tags || return 1
+      validate_groups || return 1
+      [[ "${PROMOTION_DISABLED[0]}" == 1 && ",${ROT_POOLS[0]}," != *",$PROMOTION_TAG,"* ]] || return 1
+      if [[ "$scenario" == removed-blank ]]; then [[ -z "${GROUP_TAGS[0]}" ]]; fi ;;
     roundtrip)
       load_state || return 1
       [[ "${ROT_MODES[0]}" == sequence && "${ROT_POOLS[0]}" == "$a,$b,$c" && "${ROT_MINUTES[0]}" == 30 ]] ;;
@@ -150,15 +163,17 @@ test_case() (
           '轮换连接组') printf 1 ;;
           'tag 模式') if [[ "$scenario" == configure-single-random ]]; then printf random; else printf sequence; fi ;;
           'tag 列表') if [[ "$scenario" == configure-single-* ]]; then printf '%s' "$a"; else printf '%s' "$a,$b,$c"; fi ;;
-          '轮换间隔') printf 10 ;;
+          '轮换间隔') [[ "$scenario" != configure-single-* ]] || return 1; printf 10 ;;
         esac
       }
       dialog_yesno() { return 0; }
       deploy_configuration() {
+        apply_promotion_tags || return 1
+        [[ "${PROMOTION_DISABLED[0]}" == 1 && ",${ROT_POOLS[0]}," != *",$PROMOTION_TAG,"* ]] || return 1
         touch "$INSTALL_DIR/deploy-called"
         [[ "${GROUP_SECRETS[0]}" == 11111111111111111111111111111111 && "${GROUP_TAGS[0]}" == "$a" ]] || return 1
         if [[ "$scenario" == configure-single-* ]]; then
-          [[ "${ROT_MODES[0]}" == "${scenario#configure-single-}" && "${ROT_POOLS[0]}" == "$a,$PROMOTION_TAG" && "${ROT_MINUTES[0]}" == 10 && "${ROT_NEXT[0]}" -gt "$(date +%s)" ]]
+          [[ "${ROT_MODES[0]}" == "${scenario#configure-single-}" && "${ROT_POOLS[0]}" == "$a" && "${PROMOTION_DISABLED[0]}" == 1 && "${ROT_NEXT[0]}" == 0 ]]
         else
           [[ "${ROT_MODES[0]}" == sequence && "${ROT_MINUTES[0]}" == 10 && "${ROT_NEXT[0]}" -gt "$(date +%s)" ]]
         fi
@@ -168,7 +183,7 @@ test_case() (
   esac
 )
 
-for scenario in pool duplicate malformed singleton singleton-sequence singleton-random zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery stopped-recovery inspect-failure stop-during-recovery stopped-tick multi-due timer mount directory-permissions configure-sequence configure-single-sequence configure-single-random; do
+for scenario in pool duplicate malformed singleton singleton-sequence singleton-random zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing removed-roundtrip removed-blank removed-single roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery stopped-recovery inspect-failure stop-during-recovery stopped-tick multi-due timer mount directory-permissions configure-sequence configure-single-sequence configure-single-random; do
   check "$scenario" test_case "$scenario"
 done
 printf '1..%s\n' "$((pass+fail))"

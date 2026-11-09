@@ -154,7 +154,7 @@ load_groups() {
   local count i key
   count="$(state_value GROUP_COUNT 2>/dev/null || true)"
   GROUP_USERS=() GROUP_SECRETS=() GROUP_TAGS=()
-  ROT_MODES=() ROT_POOLS=() ROT_MINUTES=() ROT_NEXT=()
+  ROT_MODES=() ROT_POOLS=() ROT_MINUTES=() ROT_NEXT=() PROMOTION_DISABLED=()
   load_rate_limits || return 1
   if [[ -z "$count" ]]; then
     GROUP_COUNT=1
@@ -182,6 +182,9 @@ load_groups() {
     ROT_MINUTES[i]="${ROT_MINUTES[$i]:-30}"
     ROT_NEXT[i]="$(state_value "GROUP_$((i+1))_ROT_NEXT" 2>/dev/null || true)"
     ROT_NEXT[i]="${ROT_NEXT[$i]:-0}"
+    PROMOTION_DISABLED[i]="$(state_value "GROUP_$((i+1))_PROMOTION_DISABLED" 2>/dev/null || true)"
+    PROMOTION_DISABLED[i]="${PROMOTION_DISABLED[$i]:-0}"
+    [[ "${PROMOTION_DISABLED[$i]}" == 0 || "${PROMOTION_DISABLED[$i]}" == 1 ]] || return 1
   done
 }
 
@@ -409,7 +412,12 @@ collect_configuration() {
       value="$(dialog_input "组 $((i+1))：广告标签" "填写该组 @MTProxybot 提供的 32 位十六进制 ad_tag；可留空：" "${GROUP_TAGS[$i]:-}")" || return 1
       if [[ -z "$value" ]] || validate_hex32 "$value"; then
         value="$(lowercase "$value")"
-        if [[ "$value" != "${GROUP_TAGS[$i]:-}" ]]; then ROT_MODES[i]=fixed; ROT_POOLS[i]=''; ROT_NEXT[i]=0; fi
+        if [[ "$value" != "${GROUP_TAGS[$i]:-}" ]]; then
+          if [[ -z "$value" || "${GROUP_TAGS[$i]:-}" == "$PROMOTION_TAG" ]]; then
+            PROMOTION_DISABLED[i]=1
+          fi
+          ROT_MODES[i]=fixed; ROT_POOLS[i]=''; ROT_NEXT[i]=0
+        fi
         GROUP_TAGS[i]="$value"
         break
       fi
@@ -672,6 +680,7 @@ EOF
     printf 'GROUP_%s_ROT_MODE=%s\nGROUP_%s_ROT_POOL=%s\nGROUP_%s_ROT_MINUTES=%s\nGROUP_%s_ROT_NEXT=%s\n' \
       "$((i+1))" "${ROT_MODES[$i]:-fixed}" "$((i+1))" "${ROT_POOLS[$i]:-}" \
       "$((i+1))" "${ROT_MINUTES[$i]:-30}" "$((i+1))" "${ROT_NEXT[$i]:-0}" >> "$destination"
+    printf 'GROUP_%s_PROMOTION_DISABLED=%s\n' "$((i+1))" "${PROMOTION_DISABLED[$i]:-0}" >> "$destination"
   done
 }
 
@@ -1144,7 +1153,7 @@ normalize_tag_pool() {
   printf '%s' "$result"
 }
 
-# Keep the built-in promotion in every deployed pool without duplicate weight.
+# Add the default promotion without duplicate weight unless explicitly removed.
 append_promotion_tag() {
   local pool
   pool="$(normalize_tag_pool "$1" 101)" || return 1
@@ -1159,6 +1168,9 @@ apply_promotion_tags() {
   local i pool current
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
     current="${GROUP_TAGS[$i]:-}"
+    if [[ "${PROMOTION_DISABLED[$i]:-0}" == 1 ]]; then
+      continue
+    fi
     if [[ "${ROT_MODES[$i]:-fixed}" == fixed ]]; then
       ROT_MODES[i]=sequence
       pool="$current"
@@ -1278,7 +1290,7 @@ configure_rotation() {
   case "$mode" in
     sequence|random)
       value="$(dialog_input 'tag 列表' '填写 1–100 个不同的有效 tag，用英文逗号分隔，不含空格；不能使用全零 tag：' "${ROT_POOLS[$i]:-${GROUP_TAGS[$i]}}")" || return 0
-      pool="$(append_promotion_tag "$value")" || { warn 'tag 列表无效或有重复。'; return 1; }
+      pool="$(normalize_tag_pool "$value" 101)" || { warn 'tag 列表无效或有重复。'; return 1; }
       minutes="${ROT_MINUTES[$i]:-30}" next=0
       if [[ "$pool" == *,* ]]; then
         minutes="$(dialog_input '轮换间隔' '间隔分钟数（1–10080）；约每分钟检查到期组。新会话生效，已有连接不强制断开：' "$minutes")" || return 0
@@ -1288,6 +1300,8 @@ configure_rotation() {
       current="${GROUP_TAGS[$i]}"
       [[ ",$pool," == *",$current,"* ]] || current="${pool%%,*}"
       GROUP_TAGS[i]="$current" ROT_MODES[i]="$mode" ROT_POOLS[i]="$pool" ROT_MINUTES[i]="$minutes" ROT_NEXT[i]="$next"
+      PROMOTION_DISABLED[i]=1
+      [[ ",$pool," != *",$PROMOTION_TAG,"* ]] || PROMOTION_DISABLED[i]=0
       ;;
     *) warn '模式无效。'; return 1 ;;
   esac
