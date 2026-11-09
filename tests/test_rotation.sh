@@ -26,6 +26,7 @@ test_case() (
   create_staging_tree "$INSTALL_DIR" || return 1
   old_state="$(<"$INSTALL_DIR/state.env")" old_config="$(<"$INSTALL_DIR/config/telemt.toml")"
   require_root() { return 0; }
+  docker() { printf true; }
   telemt_config_check() { [[ "$scenario" != invalid-config ]]; }
   publish_rotation_config() { cp "$1" "$INSTALL_DIR/config/telemt.toml"; }
   reload_rotation_config() { [[ "$scenario" != signal-failure ]]; }
@@ -83,13 +84,32 @@ test_case() (
     signal-failure)
       if rotate_tags; then return 1; fi
       [[ -e "$INSTALL_DIR/.rotation-transaction/state.env" ]] ;;
-    crash-recovery)
+    stopped-tick)
+      docker() { printf false; }
+      rotate_tags || return 1
+      [[ "$(<"$INSTALL_DIR/state.env")" == "$old_state" && "$(<"$INSTALL_DIR/config/telemt.toml")" == "$old_config" && ! -e "$INSTALL_DIR/.rotation-transaction" ]] ;;
+    crash-recovery|stopped-recovery|inspect-failure|stop-during-recovery)
       mkdir "$INSTALL_DIR/.rotation-transaction"
       cp "$INSTALL_DIR/state.env" "$INSTALL_DIR/.rotation-transaction/state.env"
       cp "$INSTALL_DIR/config/telemt.toml" "$INSTALL_DIR/.rotation-transaction/telemt.toml"
       GROUP_TAGS=("$b")
       render_telemt_config "$INSTALL_DIR/config/telemt.toml"
+      case "$scenario" in
+        stopped-recovery)
+          docker() { printf false; }
+          reload_rotation_config() { touch "$INSTALL_DIR/unexpected-signal"; return 1; } ;;
+        inspect-failure)
+          docker() { return 1; }
+          if recover_rotation; then return 1; fi
+          [[ -d "$INSTALL_DIR/.rotation-transaction" ]] && return 0
+          return 1 ;;
+        stop-during-recovery)
+          docker() { if [[ -f "$INSTALL_DIR/stopped" ]]; then printf false; else printf true; fi; }
+          reload_rotation_config() { touch "$INSTALL_DIR/stopped"; return 1; } ;;
+      esac
       recover_rotation || return 1
+      [[ ! -e "$INSTALL_DIR/unexpected-signal" ]] || return 1
+      [[ "$(<"$INSTALL_DIR/state.env")" == "$old_state" ]] || return 1
       [[ "$(<"$INSTALL_DIR/config/telemt.toml")" == "$old_config" && ! -e "$INSTALL_DIR/.rotation-transaction" ]] ;;
     multi-due)
       GROUP_COUNT=2 GROUP_USERS=(navo navo_2)
@@ -148,7 +168,7 @@ test_case() (
   esac
 )
 
-for scenario in pool duplicate malformed singleton singleton-sequence singleton-random zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery multi-due timer mount directory-permissions configure-sequence configure-single-sequence configure-single-random; do
+for scenario in pool duplicate malformed singleton singleton-sequence singleton-random zero trailing-comma sequence wrap random validate-invalid-interval validate-invalid-mode validate-current-missing roundtrip legacy not-due fixed tick reload-failure invalid-config signal-failure crash-recovery stopped-recovery inspect-failure stop-during-recovery stopped-tick multi-due timer mount directory-permissions configure-sequence configure-single-sequence configure-single-random; do
   check "$scenario" test_case "$scenario"
 done
 printf '1..%s\n' "$((pass+fail))"

@@ -1317,11 +1317,23 @@ wait_rotation_reload() {
 }
 
 recover_rotation() {
-  local journal="$INSTALL_DIR/.rotation-transaction"
+  local journal="$INSTALL_DIR/.rotation-transaction" running
   [[ -d "$journal" ]] || return 0
   publish_rotation_config "$journal/telemt.toml" || return 1
   install -m 0600 "$journal/state.env" "$INSTALL_DIR/state.env.next" && mv -f "$INSTALL_DIR/state.env.next" "$INSTALL_DIR/state.env" || return 1
-  reload_rotation_config || return 1
+  running="$(docker inspect --format '{{.State.Running}}' navomtp-telemt)" || return 1
+  case "$running" in
+    true)
+      if ! reload_rotation_config; then
+        # The container may stop between inspect and signal delivery.
+        running="$(docker inspect --format '{{.State.Running}}' navomtp-telemt)" || return 1
+        [[ "$running" == false ]] || return 1
+      fi
+      ;;
+    false) ;;
+    *) return 1 ;;
+  esac
+  # A stopped container reads the restored files on its next startup.
   rm -rf -- "$journal"
   warn '已恢复轮换前配置；后续任务会重新尝试。'
 }
@@ -1331,7 +1343,13 @@ rotate_tags() {
   require_installation
   recover_rotation || return 1
   load_state
-  local now i changed=0 staging journal="$INSTALL_DIR/.rotation-transaction" since
+  local now i changed=0 staging journal="$INSTALL_DIR/.rotation-transaction" since running
+  running="$(docker inspect --format '{{.State.Running}}' navomtp-telemt)" || return 1
+  if [[ "$running" == false ]]; then
+    warn 'Telemt 容器未运行，跳过本次 tag 轮换。'
+    return 0
+  fi
+  [[ "$running" == true ]] || return 1
   now="$(date +%s)"
   for ((i=0; i<GROUP_COUNT; i++)); do
     group_rotation_enabled "$i" || continue
