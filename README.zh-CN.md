@@ -110,7 +110,7 @@ sudo bash navomtp.sh install
 
 ### 同一链接定时轮换 tag
 
-运行 `sudo bash navomtp.sh remove-promotion`，或选择菜单第 8 项，可从所有连接组移除内置推广 tag `4caf5a6f0d774c5a865b15fd0a678343`，并保存不再自动添加的选择。当前使用该 tag 的组会切到剩余列表的第一个 tag；没有剩余 tag 时清空推广。仅剩一个 tag 的组停止轮换。此操作使用现有部署及回滚流程，可能短暂断线；源码镜像模式会触发构建。
+运行 `sudo bash navomtp.sh remove-promotion`，或选择菜单第 8 项“移除内置默认tag”，可从所有连接组移除内置默认tag `4caf5a6f0d774c5a865b15fd0a678343`，并保存不再自动添加的选择。当前使用该 tag 的组会切到剩余列表的第一个 tag；没有剩余 tag 时清空推广。仅剩一个 tag 的组停止轮换。此操作使用现有部署及回滚流程，可能短暂断线；源码镜像模式会触发构建。
 
 运行 `sudo bash navomtp.sh rotation`，或在菜单中选择“配置 tag 定时轮换”，选择已有连接组后设置模式：
 
