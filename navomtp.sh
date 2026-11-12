@@ -1311,6 +1311,44 @@ configure_rotation() {
   deploy_configuration
 }
 
+remove_promotion_tags() {
+  require_root
+  require_supported_host
+  install_base_dependencies
+  ensure_docker
+  require_installation
+  load_state
+  local i tag pool current
+  local -a tags
+  for ((i=0; i<GROUP_COUNT; i++)); do
+    pool=''
+    if [[ -n "${ROT_POOLS[$i]:-}" ]]; then
+      IFS=, read -r -a tags <<< "${ROT_POOLS[$i]}"
+      for tag in "${tags[@]}"; do
+        [[ "$(lowercase "$tag")" == "$PROMOTION_TAG" ]] && continue
+        pool+="${pool:+,}$tag"
+      done
+    fi
+    PROMOTION_DISABLED[i]=1
+    ROT_POOLS[i]="$pool"
+    current="${GROUP_TAGS[$i]}"
+    if [[ "$current" == "$PROMOTION_TAG" ]]; then
+      GROUP_TAGS[i]="${pool%%,*}"
+    fi
+    if [[ -z "$pool" ]]; then
+      ROT_MODES[i]=fixed
+      ROT_NEXT[i]=0
+    elif [[ "$pool" != *,* ]]; then
+      ROT_NEXT[i]=0
+    fi
+  done
+  sync_first_group
+  validate_groups || return 1
+  # Reuse deployment validation and rollback, including timer reconciliation.
+  deploy_configuration || return 1
+  log '已从所有连接组移除指定 tag，并保存不再自动添加的设置。'
+}
+
 publish_rotation_config() {
   install -m 0640 "$1" "$INSTALL_DIR/config/.telemt.next" && \
     chown 0:65532 "$INSTALL_DIR/config/.telemt.next" && \
@@ -1412,6 +1450,7 @@ ${PROGRAM_NAME} ${PROGRAM_VERSION}
   links        显示 Telegram 连接链接
   rotation     配置某组固定 / 顺序 / 随机 tag 轮换
   rotate       后台检查并轮换到期组（不提前轮换）
+  remove-promotion  从所有连接组移除内置推广 tag，禁止自动补回
   uninstall    卸载本项目（不卸载 Docker）
   help         显示帮助
 
@@ -1433,6 +1472,7 @@ main_menu() {
       "5" "显示连接链接" \
       "6" "卸载 NavoMTP" \
       "7" "配置 tag 定时轮换" \
+      "8" "一键移除所有组的内置推广 tag" \
       "0" "退出" 3>&1 1>&2 2>&3) || break
     case "$choice" in
       1) run_locked install_or_configure ;;
@@ -1442,6 +1482,7 @@ main_menu() {
       5) show_links ;;
       6) run_locked uninstall_navomtp; [[ -d "$INSTALL_DIR" ]] || break ;;
       7) run_locked configure_rotation ;;
+      8) run_locked remove_promotion_tags ;;
       0) break ;;
     esac
   done
@@ -1464,6 +1505,7 @@ main() {
     menu) main_menu ;;
     install|configure) run_locked install_or_configure ;;
     rotation) run_locked configure_rotation ;;
+    remove-promotion) run_locked remove_promotion_tags ;;
     rotate) run_locked rotate_tags ;;
     status) show_status ;;
     logs) show_logs ;;

@@ -110,6 +110,8 @@ To migrate an older per-group deployment, run `configure`: the former group 1 li
 
 ### Scheduled tag rotation with an unchanged link
 
+Run `sudo bash navomtp.sh remove-promotion` or choose menu item 8 to remove the built-in promotion tag `4caf5a6f0d774c5a865b15fd0a678343` from every group and persist the choice against automatic reinsertion. Groups currently using it switch to their first remaining tag, or clear promotion if none remain. Singleton pools stop rotating. This uses the deployment and rollback flow, may briefly interrupt connections, and rebuilds the image in source mode.
+
 Run `sudo bash navomtp.sh rotation` or select **Configure scheduled tag rotation** in the menu. Select an existing connection group, then choose:
 
 - `sequence`: cycle through the tag list in order.
