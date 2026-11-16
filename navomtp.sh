@@ -156,6 +156,9 @@ load_groups() {
   GROUP_USERS=() GROUP_SECRETS=() GROUP_TAGS=()
   ROT_MODES=() ROT_POOLS=() ROT_MINUTES=() ROT_NEXT=() PROMOTION_DISABLED=()
   load_rate_limits || return 1
+  DEFAULT_TAG_DISABLED="$(state_value DEFAULT_TAG_DISABLED 2>/dev/null || true)"
+  DEFAULT_TAG_DISABLED="${DEFAULT_TAG_DISABLED:-0}"
+  [[ "$DEFAULT_TAG_DISABLED" == 0 || "$DEFAULT_TAG_DISABLED" == 1 ]] || return 1
   if [[ -z "$count" ]]; then
     GROUP_COUNT=1
     GROUP_USERS[0]="$(state_value TELEMT_USER 2>/dev/null || true)"
@@ -664,6 +667,7 @@ TLS_DOMAIN=${TLS_DOMAIN}
 UPLOAD_LIMIT_MBPS=${UPLOAD_LIMIT_MBPS:-0}
 DOWNLOAD_LIMIT_MBPS=${DOWNLOAD_LIMIT_MBPS:-0}
 RATE_LIMIT_SCOPE=global
+DEFAULT_TAG_DISABLED=${DEFAULT_TAG_DISABLED:-0}
 NETWORK_SUBNET=${NETWORK_SUBNET}
 NGINX_IP=${NGINX_IP}
 TELEMT_IP=${TELEMT_IP}
@@ -1165,6 +1169,10 @@ append_promotion_tag() {
 }
 
 apply_promotion_tags() {
+  if [[ "${DEFAULT_TAG_DISABLED:-0}" == 1 ]]; then
+    sync_first_group
+    return 0
+  fi
   local i pool current
   for ((i=0; i<${GROUP_COUNT:-1}; i++)); do
     current="${GROUP_TAGS[$i]:-}"
@@ -1318,6 +1326,7 @@ remove_promotion_tags() {
   ensure_docker
   require_installation
   load_state
+  DEFAULT_TAG_DISABLED=1
   local i tag pool current
   local -a tags
   for ((i=0; i<GROUP_COUNT; i++)); do
@@ -1346,7 +1355,7 @@ remove_promotion_tags() {
   validate_groups || return 1
   # Reuse deployment validation and rollback, including timer reconciliation.
   deploy_configuration || return 1
-  log '已从所有连接组移除内置默认tag，并保存不再自动添加的设置。'
+  log '已关闭内置默认tag：已有连接组已移除，新增连接组不再自动附加。'
 }
 
 publish_rotation_config() {
@@ -1450,7 +1459,8 @@ ${PROGRAM_NAME} ${PROGRAM_VERSION}
   links        显示 Telegram 连接链接
   rotation     配置某组固定 / 顺序 / 随机 tag 轮换
   rotate       后台检查并轮换到期组（不提前轮换）
-  remove-promotion  移除内置默认tag（所有连接组），禁止自动补回
+  disable-default-tag  关闭内置默认tag，移除已有组中的该 tag，新增组不再附加
+  remove-promotion     disable-default-tag 的兼容别名
   uninstall    卸载本项目（不卸载 Docker）
   help         显示帮助
 
@@ -1472,7 +1482,7 @@ main_menu() {
       "5" "显示连接链接" \
       "6" "卸载 NavoMTP" \
       "7" "配置 tag 定时轮换" \
-      "8" "移除内置默认tag" \
+      "8" "关闭内置默认tag" \
       "0" "退出" 3>&1 1>&2 2>&3) || break
     case "$choice" in
       1) run_locked install_or_configure ;;
@@ -1505,7 +1515,7 @@ main() {
     menu) main_menu ;;
     install|configure) run_locked install_or_configure ;;
     rotation) run_locked configure_rotation ;;
-    remove-promotion) run_locked remove_promotion_tags ;;
+    disable-default-tag|remove-promotion) run_locked remove_promotion_tags ;;
     rotate) run_locked rotate_tags ;;
     status) show_status ;;
     logs) show_logs ;;

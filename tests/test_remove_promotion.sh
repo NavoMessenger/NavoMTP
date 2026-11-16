@@ -36,7 +36,9 @@ deploy_configuration() {
   render_state "$INSTALL_DIR/state.env"
 }
 remove_promotion_tags
+DEFAULT_TAG_DISABLED=0
 load_state
+[[ "$DEFAULT_TAG_DISABLED" == 1 ]]
 [[ "${ROT_POOLS[0]}" == "$a,$b" && "${GROUP_TAGS[0]}" == "$a" && "${ROT_NEXT[0]}" == 123 ]]
 [[ "${ROT_MODES[1]}" == random && "${ROT_POOLS[1]}" == "$a" && "${GROUP_TAGS[1]}" == "$a" && "${ROT_NEXT[1]}" == 0 ]]
 for i in 2 3 5; do
@@ -63,7 +65,24 @@ before="$(<"$INSTALL_DIR/state.env")"
 deploy_configuration() { return 1; }
 if remove_promotion_tags; then exit 1; fi
 [[ "$(<"$INSTALL_DIR/state.env")" == "$before" ]]
+# New groups have no per-group opt-out, but inherit the global setting.
+load_state
+GROUP_COUNT=8
+GROUP_USERS+=(navo_7 navo_8)
+GROUP_SECRETS+=(77777777777777777777777777777777 88888888888888888888888888888888)
+GROUP_TAGS+=("$b" '')
+apply_promotion_tags
+validate_groups
+[[ "${GROUP_TAGS[6]}" == "$b" && -z "${GROUP_TAGS[7]}" ]]
+[[ -z "${ROT_POOLS[6]:-}" && -z "${ROT_POOLS[7]:-}" ]]
+render_state "$INSTALL_DIR/state.env"
+DEFAULT_TAG_DISABLED=0
+load_state
+apply_promotion_tags
+validate_groups
+[[ "$DEFAULT_TAG_DISABLED" == 1 && "${GROUP_TAGS[6]}" == "$b" && -z "${GROUP_TAGS[7]}" ]]
 # The public command dispatches through the shared operation lock.
 run_locked() { [[ "$1" == remove_promotion_tags ]]; }
 main remove-promotion
+main disable-default-tag
 printf 'ok - remove across groups, persistence, idempotence, timers, failure and command dispatch\n'
